@@ -24,8 +24,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Get upstream latest release
-          UPSTREAM_LATEST=$(gh api repos/SagerNet/sing-box/releases/latest --jq .tag_name)
+          # Get upstream latest release (including pre-releases)
+          # We use 'releases' endpoint and filter for the first one, as 'latest' only returns stable releases
+          UPSTREAM_LATEST=$(gh api repos/SagerNet/sing-box/releases --jq '.[0].tag_name')
           echo "Upstream latest: $UPSTREAM_LATEST"
 
           # Get local latest release
