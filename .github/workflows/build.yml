@@ -7,50 +7,54 @@ on:
         description: 'Sing-box version tag (e.g., v1.10.0). Leave empty for latest.'
         required: false
   schedule:
-    - cron: '0 0 * * *' # Daily check
+    - cron: '0 0 * * *'
+  push:
+    tags:
+      - 'v*'
 
 permissions:
   contents: write
+
+env:
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
   check-and-build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Check for updates
+      - name: Determine target version
         id: check
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Get upstream latest release (including pre-releases)
-          # We use 'releases' endpoint and filter for the first one, as 'latest' only returns stable releases
-          UPSTREAM_LATEST=$(gh api repos/SagerNet/sing-box/releases --jq '.[0].tag_name')
-          echo "Upstream latest: $UPSTREAM_LATEST"
+          TRIGGER_TAG="${GITHUB_REF_NAME}"
 
-          # Get local latest release
-          LOCAL_LATEST=$(gh api repos/${{ github.repository }}/releases/latest --jq .tag_name || echo "none")
-          echo "Local latest: $LOCAL_LATEST"
-
-          # Determine target version
-          INPUT_TAG="${{ inputs.tag }}"
-          if [ -n "$INPUT_TAG" ]; then
-            TARGET_TAG="$INPUT_TAG"
-            FORCE_BUILD="true"
-          else
-            TARGET_TAG="$UPSTREAM_LATEST"
-            if [ "$UPSTREAM_LATEST" == "$LOCAL_LATEST" ]; then
-              echo "Already up to date."
-              echo "build=false" >> $GITHUB_OUTPUT
-              exit 0
-            fi
-            FORCE_BUILD="false"
+          if [ -n "$TRIGGER_TAG" ]; then
+            echo "build=true" >> $GITHUB_OUTPUT
+            echo "target_tag=$TRIGGER_TAG" >> $GITHUB_OUTPUT
+            echo "source=tag" >> $GITHUB_OUTPUT
+            exit 0
           fi
 
-          echo "Target tag: $TARGET_TAG"
+          INPUT_TAG="${{ inputs.tag }}"
+          if [ -n "$INPUT_TAG" ]; then
+            echo "build=true" >> $GITHUB_OUTPUT
+            echo "target_tag=$INPUT_TAG" >> $GITHUB_OUTPUT
+            echo "source=manual" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          UPSTREAM_LATEST=$(gh api repos/SagerNet/sing-box/releases --jq '.[0].tag_name')
+          LOCAL_LATEST=$(gh api repos/${{ github.repository }}/releases/latest --jq .tag_name 2>/dev/null || echo "none")
+
+          if [ "$UPSTREAM_LATEST" == "$LOCAL_LATEST" ]; then
+            echo "build=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
           echo "build=true" >> $GITHUB_OUTPUT
-          echo "target_tag=$TARGET_TAG" >> $GITHUB_OUTPUT
+          echo "target_tag=$UPSTREAM_LATEST" >> $GITHUB_OUTPUT
+          echo "source=schedule" >> $GITHUB_OUTPUT
 
       - name: Setup Go
         if: steps.check.outputs.build == 'true'
@@ -78,13 +82,69 @@ jobs:
           cd sing-box-src
           GOOS=linux GOARCH=arm64 go build -v -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_v2ray_api" -o ../sing-box-linux-arm64 ./cmd/sing-box
 
-      - name: Create Release
+      - name: Check if release exists
         if: steps.check.outputs.build == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        id: release_check
         run: |
+          if gh release view "${{ steps.check.outputs.target_tag }}" --repo ${{ github.repository }} &>/dev/null; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Determine release type
+        if: steps.check.outputs.build == 'true' && steps.release_check.outputs.exists == 'false'
+        id: release_type
+        run: |
+          TAG="${{ steps.check.outputs.target_tag }}"
+          if echo "$TAG" | grep -Eq 'alpha|beta|rc'; then
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release
+        if: steps.check.outputs.build == 'true' && steps.release_check.outputs.exists == 'false'
+        env:
+          PRERELEASE: ${{ steps.release_type.outputs.prerelease }}
+        run: |
+          PRERELEASE_FLAG=""
+          [ "$PRERELEASE" = "true" ] && PRERELEASE_FLAG="--prerelease"
+
           gh release create ${{ steps.check.outputs.target_tag }} \
-            sing-box-linux-amd64 \
-            sing-box-linux-arm64 \
+            sing-box-linux-amd64 sing-box-linux-arm64 \
+            $PRERELEASE_FLAG \
             --title "Sing-box ${{ steps.check.outputs.target_tag }} (Custom Build)" \
             --notes "Custom build with v2ray_api enabled. Upstream: SagerNet/sing-box@${{ steps.check.outputs.target_tag }}"
+
+      - name: Cleanup old releases
+        if: steps.check.outputs.build == 'true'
+        run: |
+          KEEP_RELEASE=3
+          KEEP_ALPHA=7
+
+          gh release list --repo ${{ github.repository }} --limit 50 \
+            --json tagName,isPrerelease --jq '.[] | select(.isPrerelease == false) | .tagName' \
+            > /tmp/stable.txt
+          STABLE_COUNT=$(wc -l < /tmp/stable.txt)
+          if [ "$STABLE_COUNT" -gt "$KEEP_RELEASE" ]; then
+            tail -n +$((KEEP_RELEASE + 1)) /tmp/stable.txt | while IFS= read -r t; do
+              [ -z "$t" ] && continue
+              echo "Deleting old stable: $t"
+              gh release delete "$t" --repo ${{ github.repository }} --yes 2>&1 || true
+            done
+          fi
+
+          gh release list --repo ${{ github.repository }} --limit 50 \
+            --json tagName,isPrerelease --jq '.[] | select(.isPrerelease == true) | .tagName' \
+            > /tmp/alpha.txt
+          ALPHA_COUNT=$(wc -l < /tmp/alpha.txt)
+          if [ "$ALPHA_COUNT" -gt "$KEEP_ALPHA" ]; then
+            tail -n +$((KEEP_ALPHA + 1)) /tmp/alpha.txt | while IFS= read -r t; do
+              [ -z "$t" ] && continue
+              echo "Deleting old alpha: $t"
+              gh release delete "$t" --repo ${{ github.repository }} --yes 2>&1 || true
+            done
+          fi
+
+          echo "Cleanup: stable $STABLE_COUNT->$KEEP_RELEASE, alpha $ALPHA_COUNT->$KEEP_ALPHA"
