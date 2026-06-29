@@ -7,7 +7,7 @@ on:
         description: 'Sing-box version tag (e.g., v1.10.0). Leave empty for latest.'
         required: false
   schedule:
-    - cron: '0 0 * * *'
+    - cron: '0 */4 * * *'
   push:
     tags:
       - 'v*'
@@ -44,10 +44,18 @@ jobs:
             exit 0
           fi
 
+          # Scheduled: find newest upstream release not yet built locally
           UPSTREAM_LATEST=$(gh api repos/SagerNet/sing-box/releases --jq '.[0].tag_name')
-          LOCAL_LATEST=$(gh api repos/${{ github.repository }}/releases/latest --jq .tag_name 2>/dev/null || echo "none")
+          echo "Upstream latest: $UPSTREAM_LATEST"
 
-          if [ "$UPSTREAM_LATEST" == "$LOCAL_LATEST" ]; then
+          # Collect all locally existing tags
+          gh api repos/${{ github.repository }}/releases --jq '.[].tag_name' > /tmp/local_tags.txt
+          echo "Local tags ($(wc -l < /tmp/local_tags.txt)):"
+          cat /tmp/local_tags.txt
+
+          # Check if upstream latest already exists locally
+          if grep -Fxq "$UPSTREAM_LATEST" /tmp/local_tags.txt; then
+            echo "Already built upstream $UPSTREAM_LATEST."
             echo "build=false" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -82,31 +90,9 @@ jobs:
           cd sing-box-src
           GOOS=linux GOARCH=arm64 go build -v -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_v2ray_api" -o ../sing-box-linux-arm64 ./cmd/sing-box
 
-      - name: Check if release exists
-        if: steps.check.outputs.build == 'true'
-        id: release_check
-        run: |
-          if gh release view "${{ steps.check.outputs.target_tag }}" --repo ${{ github.repository }} &>/dev/null; then
-            echo "exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "exists=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Determine release type
-        if: steps.check.outputs.build == 'true' && steps.release_check.outputs.exists == 'false'
-        id: release_type
-        run: |
-          TAG="${{ steps.check.outputs.target_tag }}"
-          if echo "$TAG" | grep -Eq 'alpha|beta|rc'; then
-            echo "prerelease=true" >> $GITHUB_OUTPUT
-          else
-            echo "prerelease=false" >> $GITHUB_OUTPUT
-          fi
-
       - name: Create Release
-        if: steps.check.outputs.build == 'true' && steps.release_check.outputs.exists == 'false'
         env:
-          PRERELEASE: ${{ steps.release_type.outputs.prerelease }}
+          PRERELEASE: ${{ contains(steps.check.outputs.target_tag, 'alpha') || contains(steps.check.outputs.target_tag, 'beta') || contains(steps.check.outputs.target_tag, 'rc') }}
         run: |
           PRERELEASE_FLAG=""
           [ "$PRERELEASE" = "true" ] && PRERELEASE_FLAG="--prerelease"
@@ -118,14 +104,13 @@ jobs:
             --notes "Custom build with v2ray_api enabled. Upstream: SagerNet/sing-box@${{ steps.check.outputs.target_tag }}"
 
       - name: Cleanup old releases
-        if: steps.check.outputs.build == 'true'
         run: |
           KEEP_RELEASE=3
           KEEP_ALPHA=7
 
-          gh release list --repo ${{ github.repository }} --limit 50 \
-            --json tagName,isPrerelease --jq '.[] | select(.isPrerelease == false) | .tagName' \
-            > /tmp/stable.txt
+          gh api repos/${{ github.repository }}/releases --jq '.[] | "\(.tag_name) \(.prerelease)"' > /tmp/all.txt
+
+          grep ' false$' /tmp/all.txt | awk '{print $1}' > /tmp/stable.txt
           STABLE_COUNT=$(wc -l < /tmp/stable.txt)
           if [ "$STABLE_COUNT" -gt "$KEEP_RELEASE" ]; then
             tail -n +$((KEEP_RELEASE + 1)) /tmp/stable.txt | while IFS= read -r t; do
@@ -135,9 +120,7 @@ jobs:
             done
           fi
 
-          gh release list --repo ${{ github.repository }} --limit 50 \
-            --json tagName,isPrerelease --jq '.[] | select(.isPrerelease == true) | .tagName' \
-            > /tmp/alpha.txt
+          grep ' true$' /tmp/all.txt | awk '{print $1}' > /tmp/alpha.txt
           ALPHA_COUNT=$(wc -l < /tmp/alpha.txt)
           if [ "$ALPHA_COUNT" -gt "$KEEP_ALPHA" ]; then
             tail -n +$((KEEP_ALPHA + 1)) /tmp/alpha.txt | while IFS= read -r t; do
