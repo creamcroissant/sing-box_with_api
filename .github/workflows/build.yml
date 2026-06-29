@@ -7,7 +7,7 @@ on:
         description: 'Sing-box version tag (e.g., v1.10.0). Leave empty for latest.'
         required: false
   schedule:
-    - cron: '0 */4 * * *'
+    - cron: '0 0 * * *'
   push:
     tags:
       - 'v*'
