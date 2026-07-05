@@ -73,14 +73,17 @@ jobs:
       - name: Checkout Upstream
         if: steps.check.outputs.build == 'true'
         run: |
+          set -x
           TAG="${{ steps.check.outputs.target_tag }}"
           echo "Target tag: [$TAG]"
-          gh api "repos/SagerNet/sing-box/tarball/${TAG}" > /tmp/upstream.tar.gz
+          echo "=== testing raw internet ==="
+          curl -s --connect-timeout 5 https://httpbin.org/ip 2>&1 || echo "httpbin failed"
+          ping -c 1 github.com 2>&1 | head -2 || echo "ping failed"
+          echo "=== gh auth status ==="
+          gh auth status 2>&1 || echo "gh auth failed"
+          echo "=== gh api ==="
+          gh api "repos/SagerNet/sing-box/tarball/${TAG}" -o /tmp/upstream.tar.gz 2>&1
           ls -lh /tmp/upstream.tar.gz
-          tar xzf /tmp/upstream.tar.gz -C "$GITHUB_WORKSPACE"
-          cd "$GITHUB_WORKSPACE"
-          mv *sing-box*/ sing-box-src 2>/dev/null || { ls -d */; exit 1; }
-          ls -d sing-box-src/
 
       - name: Build AMD64
         if: steps.check.outputs.build == 'true'
