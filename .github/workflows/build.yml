@@ -78,6 +78,7 @@ jobs:
           ref: ${{ steps.check.outputs.target_tag }}
           path: sing-box-src
           persist-credentials: false
+          fetch-depth: 1
 
       - name: Build AMD64
         if: steps.check.outputs.build == 'true'
