@@ -75,10 +75,10 @@ jobs:
         run: |
           TAG="${{ steps.check.outputs.target_tag }}"
           echo "Target tag: [$TAG]"
-          gh release download "$TAG" --repo SagerNet/sing-box --archive tar.gz
-          FILE="$(ls *.tar.gz 2>/dev/null | head -1)"
-          echo "archive: $FILE"
-          tar xzf "$FILE" && rm -f "$FILE"
+          gh api "repos/SagerNet/sing-box/tarball/${TAG}" > /tmp/upstream.tar.gz
+          ls -lh /tmp/upstream.tar.gz
+          tar xzf /tmp/upstream.tar.gz -C "$GITHUB_WORKSPACE"
+          cd "$GITHUB_WORKSPACE"
           mv *sing-box*/ sing-box-src 2>/dev/null || { ls -d */; exit 1; }
           ls -d sing-box-src/
 
