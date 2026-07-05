@@ -75,8 +75,10 @@ jobs:
         run: |
           TAG="${{ steps.check.outputs.target_tag }}"
           echo "Target tag: $TAG"
-          curl -sL "https://github.com/SagerNet/sing-box/archive/refs/tags/${TAG}.tar.gz" | tar xz
-          mv sing-box-* sing-box-src
+          curl -sL "https://codeload.github.com/SagerNet/sing-box/tar.gz/refs/tags/${TAG}" -o /tmp/upstream.tar.gz
+          ls -lh /tmp/upstream.tar.gz
+          tar xzf /tmp/upstream.tar.gz
+          mv *sing-box* sing-box-src
 
       - name: Build AMD64
         if: steps.check.outputs.build == 'true'
