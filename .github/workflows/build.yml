@@ -22,7 +22,7 @@ jobs:
   check-and-build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Determine target version
         id: check
@@ -68,11 +68,11 @@ jobs:
         if: steps.check.outputs.build == 'true'
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: 'stable'
 
       - name: Checkout Upstream
         if: steps.check.outputs.build == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: SagerNet/sing-box
           ref: ${{ steps.check.outputs.target_tag }}
