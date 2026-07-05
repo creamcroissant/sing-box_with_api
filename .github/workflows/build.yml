@@ -72,8 +72,12 @@ jobs:
 
       - name: Checkout Upstream
         if: steps.check.outputs.build == 'true'
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+          GIT_ASKPASS: "echo"
         run: |
-          git clone --depth 1 --branch ${{ steps.check.outputs.target_tag }} https://github.com/SagerNet/sing-box.git sing-box-src
+          echo "Target tag: ${{ steps.check.outputs.target_tag }}"
+          git -c credential.helper= clone --depth 1 --branch "${{ steps.check.outputs.target_tag }}" https://github.com/SagerNet/sing-box.git sing-box-src 2>&1
 
       - name: Build AMD64
         if: steps.check.outputs.build == 'true'
