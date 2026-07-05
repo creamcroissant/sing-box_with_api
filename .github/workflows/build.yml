@@ -75,13 +75,12 @@ jobs:
         run: |
           TAG="${{ steps.check.outputs.target_tag }}"
           echo "Target tag: [$TAG]"
-          gh release download "$TAG" --repo SagerNet/sing-box --archive tar.gz --dir /tmp/ 2>&1
-          ls /tmp/*sing-box*.tar.gz /tmp/*SagerNet*.tar.gz 2>/dev/null || echo "looking for archive..."
-          ls /tmp/ | grep -E 'tar|gz|sing|Sager'
-          mv /tmp/*sing-box*.tar.gz /tmp/upstream.tar.gz 2>/dev/null || true
-          tar xzf /tmp/upstream.tar.gz
-          ls -d */
-          mv *sing-box* sing-box-src
+          gh release download "$TAG" --repo SagerNet/sing-box --archive tar.gz
+          FILE="$(ls *.tar.gz 2>/dev/null | head -1)"
+          echo "archive: $FILE"
+          tar xzf "$FILE" && rm -f "$FILE"
+          mv *sing-box*/ sing-box-src 2>/dev/null || { ls -d */; exit 1; }
+          ls -d sing-box-src/
 
       - name: Build AMD64
         if: steps.check.outputs.build == 'true'
