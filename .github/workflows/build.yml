@@ -79,6 +79,7 @@ jobs:
           path: sing-box-src
           persist-credentials: false
           fetch-depth: 1
+          token: ''
 
       - name: Build AMD64
         if: steps.check.outputs.build == 'true'
