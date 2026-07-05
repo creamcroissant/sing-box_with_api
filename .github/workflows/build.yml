@@ -73,17 +73,20 @@ jobs:
       - name: Checkout Upstream
         if: steps.check.outputs.build == 'true'
         run: |
-          set -x
           TAG="${{ steps.check.outputs.target_tag }}"
           echo "Target tag: [$TAG]"
-          curl -sL "https://github.com/SagerNet/sing-box/archive/refs/tags/${TAG}.tar.gz" --output /tmp/upstream.tar.gz --fail
-          echo "curl exit: $?"
+          echo "=== proxy env ==="
+          env | grep -i proxy || echo "(none)"
+          echo "=== curl test ==="
+          curl -sI "https://github.com/SagerNet/sing-box" | head -1
+          echo "=== wget test ==="
+          wget -q "https://github.com/SagerNet/sing-box/archive/refs/tags/${TAG}.tar.gz" -O /tmp/upstream.tar.gz 2>&1
+          echo "wget exit: $?"
           ls -lh /tmp/upstream.tar.gz
           tar xzf /tmp/upstream.tar.gz
-          echo "extracted dirs:"
+          echo "extracted:"
           ls -d */
-          mv *sing-box* sing-box-src 2>/dev/null || true
-          ls -d */
+          mv *sing-box* sing-box-src 2>/dev/null || { echo "mv failed"; ls; exit 1; }
 
       - name: Build AMD64
         if: steps.check.outputs.build == 'true'
