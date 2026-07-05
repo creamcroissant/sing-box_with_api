@@ -72,20 +72,13 @@ jobs:
 
       - name: Checkout Upstream
         if: steps.check.outputs.build == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="${{ steps.check.outputs.target_tag }}"
-          echo "Target tag: [$TAG]"
-          echo "=== test1: curl github.com ==="
-          curl -sI "https://github.com" --connect-timeout 5 2>&1 | head -1
-          echo "=== test2: gh api current repo ==="
-          gh api repos/creamcroissant/sing-box_with_api --jq .full_name 2>&1
-          echo "=== test3: gh api SagerNet ==="
-          gh api repos/SagerNet/sing-box --jq .full_name 2>&1
-          echo "=== test4: git ls-remote ==="
-          git ls-remote https://github.com/SagerNet/sing-box.git HEAD 2>&1 | head -1
-          echo "Success!"
+        uses: actions/checkout@v5
+        with:
+          repository: SagerNet/sing-box
+          ref: refs/tags/${{ steps.check.outputs.target_tag }}
+          path: sing-box-src
+          persist-credentials: false
+          fetch-depth: 1
 
       - name: Build AMD64
         if: steps.check.outputs.build == 'true'
