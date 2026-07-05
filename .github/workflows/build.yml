@@ -72,11 +72,8 @@ jobs:
 
       - name: Checkout Upstream
         if: steps.check.outputs.build == 'true'
-        uses: actions/checkout@v5
-        with:
-          repository: SagerNet/sing-box
-          ref: ${{ steps.check.outputs.target_tag }}
-          path: sing-box-src
+        run: |
+          git clone --depth 1 --branch ${{ steps.check.outputs.target_tag }} https://github.com/SagerNet/sing-box.git sing-box-src
 
       - name: Build AMD64
         if: steps.check.outputs.build == 'true'
