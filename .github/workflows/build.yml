@@ -75,12 +75,8 @@ jobs:
         run: |
           TAG="${{ steps.check.outputs.target_tag }}"
           echo "Target tag: $TAG"
-          mkdir -p sing-box-src
-          cd sing-box-src
-          git init -q
-          git remote add origin https://github.com/SagerNet/sing-box.git
-          git fetch --depth 1 origin "refs/tags/${TAG}"
-          git checkout -q FETCH_HEAD
+          curl -sL "https://github.com/SagerNet/sing-box/archive/refs/tags/${TAG}.tar.gz" | tar xz
+          mv sing-box-* sing-box-src
 
       - name: Build AMD64
         if: steps.check.outputs.build == 'true'
