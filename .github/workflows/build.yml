@@ -73,12 +73,17 @@ jobs:
       - name: Checkout Upstream
         if: steps.check.outputs.build == 'true'
         run: |
+          set -x
           TAG="${{ steps.check.outputs.target_tag }}"
-          echo "Target tag: $TAG"
-          curl -sL "https://codeload.github.com/SagerNet/sing-box/tar.gz/refs/tags/${TAG}" -o /tmp/upstream.tar.gz
+          echo "Target tag: [$TAG]"
+          curl -sL "https://github.com/SagerNet/sing-box/archive/refs/tags/${TAG}.tar.gz" --output /tmp/upstream.tar.gz --fail
+          echo "curl exit: $?"
           ls -lh /tmp/upstream.tar.gz
           tar xzf /tmp/upstream.tar.gz
-          mv *sing-box* sing-box-src
+          echo "extracted dirs:"
+          ls -d */
+          mv *sing-box* sing-box-src 2>/dev/null || true
+          ls -d */
 
       - name: Build AMD64
         if: steps.check.outputs.build == 'true'
