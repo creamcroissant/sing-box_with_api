@@ -77,19 +77,15 @@ jobs:
         run: |
           TAG="${{ steps.check.outputs.target_tag }}"
           echo "Target tag: [$TAG]"
-          echo "=== curl check ==="
-          curl -sI "https://github.com/SagerNet/sing-box" --connect-timeout 10 2>&1 | head -3
-          echo "=== gh api check ==="
-          gh api "repos/SagerNet/sing-box/releases/tags/${TAG}" --jq .tag_name 2>&1
-          echo "=== download ==="
-          gh api "repos/SagerNet/sing-box/tarball/${TAG}" > /tmp/upstream.tar.gz
-          echo "download exit: $?"
-          file /tmp/upstream.tar.gz 2>&1
-          tar tzf /tmp/upstream.tar.gz 2>&1 | head -3
-          tar xzf /tmp/upstream.tar.gz -C "$GITHUB_WORKSPACE" 2>&1
-          echo "extract exit: $?"
-          ls -d "$GITHUB_WORKSPACE"/*sing-box*/ 2>&1
-          mv "$GITHUB_WORKSPACE/"*sing-box*/ "$GITHUB_WORKSPACE/sing-box-src" 2>&1 || { echo "mv failed"; ls "$GITHUB_WORKSPACE"/; exit 1; }
+          echo "=== test1: curl github.com ==="
+          curl -sI "https://github.com" --connect-timeout 5 2>&1 | head -1
+          echo "=== test2: gh api current repo ==="
+          gh api repos/creamcroissant/sing-box_with_api --jq .full_name 2>&1
+          echo "=== test3: gh api SagerNet ==="
+          gh api repos/SagerNet/sing-box --jq .full_name 2>&1
+          echo "=== test4: git ls-remote ==="
+          git ls-remote https://github.com/SagerNet/sing-box.git HEAD 2>&1 | head -1
+          echo "Success!"
 
       - name: Build AMD64
         if: steps.check.outputs.build == 'true'
