@@ -92,6 +92,7 @@ jobs:
           GOOS=linux GOARCH=arm64 go build -v -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_v2ray_api" -o ../sing-box-linux-arm64 ./cmd/sing-box
 
       - name: Create Release
+        if: steps.check.outputs.build == 'true'
         env:
           PRERELEASE: ${{ contains(steps.check.outputs.target_tag, 'alpha') || contains(steps.check.outputs.target_tag, 'beta') || contains(steps.check.outputs.target_tag, 'rc') }}
         run: |
