@@ -39,10 +39,10 @@ index 0000000..2403e73
 +}
 \ No newline at end of file
 diff --git a/box.go b/box.go
-index f06a117..c8fa2ac 100644
+index c88a9bc..6cfe8bd 100644
 --- a/box.go
 +++ b/box.go
-@@ -430,7 +430,7 @@ func New(options Options) (*Box, error) {
+@@ -356,7 +356,7 @@ func New(options Options) (*Box, error) {
  		internalServices = append(internalServices, clashServer)
  	}
  	if needV2RayAPI {
@@ -77,17 +77,17 @@ index cf47963..85147ea 100644
 +	return v2rayServerConstructor(logger, inboundManager, options)
  }
 diff --git a/experimental/v2rayapi/server.go b/experimental/v2rayapi/server.go
-index 8ebae1c..8b22fea 100644
+index 8ebae1c..1b5469f 100644
 --- a/experimental/v2rayapi/server.go
 +++ b/experimental/v2rayapi/server.go
-@@ -12,6 +12,8 @@ import (
- 	"github.com/sagernet/sing/common"
+@@ -2,6 +2,8 @@ package v2rayapi
  
- 	"google.golang.org/grpc"
-+	command "github.com/sagernet/sing-box/experimental/v2rayapi/xraypb/app/proxyman/command"
+ import (
+ 	"errors"
 +
- 	"google.golang.org/grpc/credentials/insecure"
- )
++	command "github.com/sagernet/sing-box/experimental/v2rayapi/xraypb/app/proxyman/command"
+ 	"net"
+ 	"net/http"
  
 @@ -29,12 +31,13 @@ type Server struct {
  	statsService *StatsService
@@ -1902,14 +1902,13 @@ index 7f1f6b9..8a46b6f 100644
  	})
  }
 diff --git a/protocol/trojan/inbound.go b/protocol/trojan/inbound.go
-index 920589b..7c32795 100644
+index 6e11c08..2d3da3e 100644
 --- a/protocol/trojan/inbound.go
 +++ b/protocol/trojan/inbound.go
-@@ -260,3 +260,31 @@ func (h *inboundTransportHandler) NewConnectionEx(ctx context.Context, conn net.
+@@ -260,3 +260,30 @@ func (h *inboundTransportHandler) NewConnectionEx(ctx context.Context, conn net.
  	h.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
- 	(*Inbound)(h).NewConnection(ctx, conn, metadata, onClose)
+ 	(*Inbound)(h).NewConnectionEx(ctx, conn, metadata, onClose)
  }
-+
 +// UpdateUsers implements adapter.InboundUserManager (runtime user management
 +// unified with Xray HandlerService semantics).
 +func (h *Inbound) UpdateUsers(users []adapter.ManagedUser) error {
@@ -1938,14 +1937,13 @@ index 920589b..7c32795 100644
 +	return out
 +}
 diff --git a/protocol/vless/inbound.go b/protocol/vless/inbound.go
-index 1589bfb..9086898 100644
+index 75cd412..c6b1ebb 100644
 --- a/protocol/vless/inbound.go
 +++ b/protocol/vless/inbound.go
-@@ -220,3 +220,32 @@ func (h *inboundTransportHandler) NewConnectionEx(ctx context.Context, conn net.
+@@ -220,3 +220,31 @@ func (h *inboundTransportHandler) NewConnectionEx(ctx context.Context, conn net.
  	h.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
- 	(*Inbound)(h).NewConnection(ctx, conn, metadata, onClose)
+ 	(*Inbound)(h).NewConnectionEx(ctx, conn, metadata, onClose)
  }
-+
 +// UpdateUsers implements adapter.InboundUserManager (runtime user management
 +// unified with Xray HandlerService semantics). Replaces the user table at
 +// runtime — new connections authenticate immediately, no reload needed.
@@ -1975,14 +1973,13 @@ index 1589bfb..9086898 100644
 +	return out
 +}
 diff --git a/protocol/vmess/inbound.go b/protocol/vmess/inbound.go
-index 8783d3e..d10f193 100644
+index 4e9c763..f48ea1d 100644
 --- a/protocol/vmess/inbound.go
 +++ b/protocol/vmess/inbound.go
-@@ -226,3 +226,33 @@ func (h *inboundTransportHandler) NewConnectionEx(ctx context.Context, conn net.
+@@ -226,3 +226,32 @@ func (h *inboundTransportHandler) NewConnectionEx(ctx context.Context, conn net.
  	h.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
- 	(*Inbound)(h).NewConnection(ctx, conn, metadata, onClose)
+ 	(*Inbound)(h).NewConnectionEx(ctx, conn, metadata, onClose)
  }
-+
 +// UpdateUsers implements adapter.InboundUserManager (runtime user management
 +// unified with Xray HandlerService semantics).
 +func (h *Inbound) UpdateUsers(users []adapter.ManagedUser) error {
