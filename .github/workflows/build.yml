@@ -110,11 +110,19 @@ jobs:
           PRERELEASE_FLAG=""
           [ "$PRERELEASE" = "true" ] && PRERELEASE_FLAG="--prerelease"
 
-          gh release create ${{ steps.check.outputs.target_tag }} \
-            sing-box-linux-amd64 sing-box-linux-arm64 \
-            $PRERELEASE_FLAG \
-            --title "Sing-box ${{ steps.check.outputs.target_tag }} (Custom Build)" \
-            --notes "Custom build with v2ray_api enabled. Upstream: SagerNet/sing-box@${{ steps.check.outputs.target_tag }}"
+          TAG="${{ steps.check.outputs.target_tag }}"
+          # 幂等：release 已存在则复用并覆盖 assets（手动重跑同 tag 不冲突）
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; uploading assets (clobber)"
+            gh release upload "$TAG" sing-box-linux-amd64 sing-box-linux-arm64 --clobber
+          else
+            echo "Creating release $TAG"
+            gh release create "$TAG" \
+              sing-box-linux-amd64 sing-box-linux-arm64 \
+              $PRERELEASE_FLAG \
+              --title "Sing-box $TAG (Custom Build)" \
+              --notes "Custom build with v2ray_api enabled + runtime user-management (HandlerService). Upstream: SagerNet/sing-box@$TAG"
+          fi
 
       - name: Cleanup old releases
         run: |
