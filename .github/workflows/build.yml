@@ -81,6 +81,15 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
+      - name: Apply User Service Patch
+        if: steps.check.outputs.build == 'true'
+        run: |
+          cd sing-box-src
+          git config user.email "ci@mgpanel.local"
+          git config user.name "mgpanel CI"
+          git apply --verbose "../patches/user-service.patch"
+          echo "User Service patch applied OK"
+
       - name: Build AMD64
         if: steps.check.outputs.build == 'true'
         run: |

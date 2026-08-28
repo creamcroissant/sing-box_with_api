@@ -1,0 +1,2014 @@
+diff --git a/adapter/inbound_user.go b/adapter/inbound_user.go
+new file mode 100644
+index 0000000..2403e73
+--- /dev/null
++++ b/adapter/inbound_user.go
+@@ -0,0 +1,33 @@
++package adapter
++
++// ManagedUser is a provider-agnostic description of an inbound user that can be
++// managed at runtime through the v2ray-api HandlerService (unified with Xray's
++// HandlerService semantics).
++//
++// Fields:
++//   - Name:     stable identifier / email. vless/vmess use the UUID itself (also
++//     exposed via UUID); trojan/shadowsocks/snell/hysteria2/tuic use a
++//     user-chosen name that must be stable so RemoveUser can reference it.
++//   - UUID:     protocol UUID (vless/vmess/tuic). Empty for password protocols.
++//   - Password: protocol password (trojan/shadowsocks/hysteria2/naive/...).
++//   - Flow:     vless flow (xtls-rprx-vision, etc). Empty when not used.
++type ManagedUser struct {
++	Name     string
++	UUID     string
++	Password string
++	Flow     string
++}
++
++// InboundUserManager is implemented by inbounds that support runtime user
++// management. It is detected via type assertion by the v2ray-api UserService.
++//
++// Implementations must call the underlying protocol Service.UpdateUsers (or the
++// equivalent) so that new connections authenticate against the updated table
++// immediately — no config reload or restart is required.
++type InboundUserManager interface {
++	Inbound
++	// UpdateUsers replaces the inbound's user table at runtime.
++	UpdateUsers(users []ManagedUser) error
++	// Users returns the current runtime user table.
++	Users() []ManagedUser
++}
+\ No newline at end of file
+diff --git a/box.go b/box.go
+index f06a117..c8fa2ac 100644
+--- a/box.go
++++ b/box.go
+@@ -430,7 +430,7 @@ func New(options Options) (*Box, error) {
+ 		internalServices = append(internalServices, clashServer)
+ 	}
+ 	if needV2RayAPI {
+-		v2rayServer, err := experimental.NewV2RayServer(logFactory.NewLogger("v2ray-api"), common.PtrValueOrDefault(experimentalOptions.V2RayAPI))
++		v2rayServer, err := experimental.NewV2RayServer(logFactory.NewLogger("v2ray-api"), inboundManager, common.PtrValueOrDefault(experimentalOptions.V2RayAPI))
+ 		if err != nil {
+ 			return nil, E.Cause(err, "create v2ray-server")
+ 		}
+diff --git a/experimental/v2rayapi.go b/experimental/v2rayapi.go
+index cf47963..85147ea 100644
+--- a/experimental/v2rayapi.go
++++ b/experimental/v2rayapi.go
+@@ -8,7 +8,7 @@ import (
+ 	"github.com/sagernet/sing-box/option"
+ )
+ 
+-type V2RayServerConstructor = func(logger log.Logger, options option.V2RayAPIOptions) (adapter.V2RayServer, error)
++type V2RayServerConstructor = func(logger log.Logger, inboundManager adapter.InboundManager, options option.V2RayAPIOptions) (adapter.V2RayServer, error)
+ 
+ var v2rayServerConstructor V2RayServerConstructor
+ 
+@@ -16,9 +16,9 @@ func RegisterV2RayServerConstructor(constructor V2RayServerConstructor) {
+ 	v2rayServerConstructor = constructor
+ }
+ 
+-func NewV2RayServer(logger log.Logger, options option.V2RayAPIOptions) (adapter.V2RayServer, error) {
++func NewV2RayServer(logger log.Logger, inboundManager adapter.InboundManager, options option.V2RayAPIOptions) (adapter.V2RayServer, error) {
+ 	if v2rayServerConstructor == nil {
+ 		return nil, os.ErrInvalid
+ 	}
+-	return v2rayServerConstructor(logger, options)
++	return v2rayServerConstructor(logger, inboundManager, options)
+ }
+diff --git a/experimental/v2rayapi/server.go b/experimental/v2rayapi/server.go
+index 8ebae1c..8b22fea 100644
+--- a/experimental/v2rayapi/server.go
++++ b/experimental/v2rayapi/server.go
+@@ -12,6 +12,8 @@ import (
+ 	"github.com/sagernet/sing/common"
+ 
+ 	"google.golang.org/grpc"
++	command "github.com/sagernet/sing-box/experimental/v2rayapi/xraypb/app/proxyman/command"
++
+ 	"google.golang.org/grpc/credentials/insecure"
+ )
+ 
+@@ -29,12 +31,13 @@ type Server struct {
+ 	statsService *StatsService
+ }
+ 
+-func NewServer(logger log.Logger, options option.V2RayAPIOptions) (adapter.V2RayServer, error) {
++func NewServer(logger log.Logger, inboundManager adapter.InboundManager, options option.V2RayAPIOptions) (adapter.V2RayServer, error) {
+ 	grpcServer := grpc.NewServer(grpc.Creds(insecure.NewCredentials()))
+ 	statsService := NewStatsService(common.PtrValueOrDefault(options.Stats))
+ 	if statsService != nil {
+ 		RegisterStatsServiceServer(grpcServer, statsService)
+ 	}
++	command.RegisterHandlerServiceServer(grpcServer, NewUserService(inboundManager))
+ 	server := &Server{
+ 		logger:       logger,
+ 		listen:       options.Listen,
+diff --git a/experimental/v2rayapi/user_service.go b/experimental/v2rayapi/user_service.go
+new file mode 100644
+index 0000000..d1f762d
+--- /dev/null
++++ b/experimental/v2rayapi/user_service.go
+@@ -0,0 +1,281 @@
++package v2rayapi
++
++import (
++	"context"
++	"errors"
++	"strings"
++
++	"github.com/sagernet/sing-box/adapter"
++	command "github.com/sagernet/sing-box/experimental/v2rayapi/xraypb/app/proxyman/command"
++	protocol "github.com/sagernet/sing-box/experimental/v2rayapi/xraypb/common/protocol"
++	serial "github.com/sagernet/sing-box/experimental/v2rayapi/xraypb/common/serial"
++	vless "github.com/sagernet/sing-box/experimental/v2rayapi/xraypb/proxy/vless"
++	vmess "github.com/sagernet/sing-box/experimental/v2rayapi/xraypb/proxy/vmess"
++
++	"google.golang.org/protobuf/encoding/protowire"
++	"google.golang.org/protobuf/proto"
++)
++
++var ErrUnsupportedOperation = errors.New("runtime user management not supported by inbound")
++
++// UserService implements xray.app.proxyman.command.HandlerService with
++// semantics unified with Xray-core: same gRPC service name, methods and
++// message shell (AlterInbound + AddUserOperation/RemoveUserOperation), so a
++// single agent-side client can manage users at runtime on both sing-box and
++// Xray cores without reload.
++//
++// Credential payload is carried in the account TypedMessage:
++//   - type "xboard.user.ManagedUser": protowire-encoded {name=1,uuid=2,password=3,flow=4}
++//     used for every protocol (vless/vmess/trojan/ss/hysteria2/tuic/...).
++//   - Official Xray accounts are also accepted for interop:
++//     "xray.proxy.vless.Account" (id/flow), "xray.proxy.vmess.Account" (id).
++type UserService struct {
++	command.UnimplementedHandlerServiceServer
++	inbound adapter.InboundManager
++}
++
++func NewUserService(inbound adapter.InboundManager) *UserService {
++	return &UserService{inbound: inbound}
++}
++
++const (
++	accountTypeManagedUser = "xboard.user.ManagedUser"
++	accountTypeVLess       = "xray.proxy.vless.Account"
++	accountTypeVMess       = "xray.proxy.vmess.Account"
++	opTypeAddUser          = "xray.app.proxyman.command.AddUserOperation"
++	opTypeRemoveUser       = "xray.app.proxyman.command.RemoveUserOperation"
++)
++
++// AlterInbound applies a user-management operation to an inbound by tag.
++func (s *UserService) AlterInbound(ctx context.Context, req *command.AlterInboundRequest) (*command.AlterInboundResponse, error) {
++	if req == nil || req.Tag == "" {
++		return nil, errors.New("inbound tag is required")
++	}
++	inbound, ok := s.inbound.Get(req.Tag)
++	if !ok {
++		return nil, errors.New("inbound not found: " + req.Tag)
++	}
++	um, ok := inbound.(adapter.InboundUserManager)
++	if !ok {
++		return nil, errors.New("inbound does not support runtime user management: " + req.Tag)
++	}
++	if req.Operation == nil {
++		return nil, errors.New("operation is required")
++	}
++	typ := normalizeType(req.Operation.Type)
++	switch typ {
++	case opTypeAddUser:
++		var op command.AddUserOperation
++		if err := proto.Unmarshal(req.Operation.Value, &op); err != nil {
++			return nil, err
++		}
++		return &command.AlterInboundResponse{}, addUser(um, op.GetUser())
++	case opTypeRemoveUser:
++		var op command.RemoveUserOperation
++		if err := proto.Unmarshal(req.Operation.Value, &op); err != nil {
++			return nil, err
++		}
++		return &command.AlterInboundResponse{}, removeUser(um, op.GetEmail())
++	}
++	return nil, errors.New("unsupported operation type: " + req.Operation.Type)
++}
++
++func addUser(um adapter.InboundUserManager, user *protocol.User) error {
++	if user == nil {
++		return errors.New("user is nil")
++	}
++	mu, err := userFromProto(user)
++	if err != nil {
++		return err
++	}
++	existing := um.Users()
++	for _, u := range existing {
++		if u.Name == mu.Name && len(mu.Name) > 0 {
++			return errors.New("user already exists: " + mu.Name)
++		}
++	}
++	return um.UpdateUsers(append(existing, mu))
++}
++
++func removeUser(um adapter.InboundUserManager, name string) error {
++	if name == "" {
++		return errors.New("user name is required")
++	}
++	existing := um.Users()
++	kept := make([]adapter.ManagedUser, 0, len(existing))
++	found := false
++	for _, u := range existing {
++		if u.Name == name {
++			found = true
++			continue
++		}
++		kept = append(kept, u)
++	}
++	if !found {
++		return nil // idempotent
++	}
++	return um.UpdateUsers(kept)
++}
++
++// GetInboundUsers returns the current runtime user table of an inbound.
++func (s *UserService) GetInboundUsers(ctx context.Context, req *command.GetInboundUserRequest) (*command.GetInboundUserResponse, error) {
++	if req == nil || req.Tag == "" {
++		return nil, errors.New("inbound tag is required")
++	}
++	inbound, ok := s.inbound.Get(req.Tag)
++	if !ok {
++		return nil, errors.New("inbound not found: " + req.Tag)
++	}
++	um, ok := inbound.(adapter.InboundUserManager)
++	if !ok {
++		return nil, errors.New("inbound does not support runtime user management: " + req.Tag)
++	}
++	users := um.Users()
++	if req.GetEmail() != "" {
++		for _, u := range users {
++			if u.Name == req.GetEmail() {
++				return &command.GetInboundUserResponse{Users: []*protocol.User{userToProto(u)}}, nil
++			}
++		}
++		return &command.GetInboundUserResponse{Users: []*protocol.User{}}, nil
++	}
++	resp := &command.GetInboundUserResponse{Users: make([]*protocol.User, 0, len(users))}
++	for _, u := range users {
++		resp.Users = append(resp.Users, userToProto(u))
++	}
++	return resp, nil
++}
++
++// GetInboundUsersCount returns the number of users in an inbound.
++func (s *UserService) GetInboundUsersCount(ctx context.Context, req *command.GetInboundUserRequest) (*command.GetInboundUsersCountResponse, error) {
++	if req == nil {
++		return nil, errors.New("inbound tag is required")
++	}
++	inbound, ok := s.inbound.Get(req.Tag)
++	if !ok {
++		return nil, errors.New("inbound not found: " + req.Tag)
++	}
++	um, ok := inbound.(adapter.InboundUserManager)
++	if !ok {
++		return nil, errors.New("inbound does not support runtime user management: " + req.Tag)
++	}
++	return &command.GetInboundUsersCountResponse{Count: int64(len(um.Users()))}, nil
++}
++
++// normalizeType strips a leading "type.googleapis.com/" prefix if present.
++func normalizeType(t string) string {
++	return strings.TrimPrefix(t, "type.googleapis.com/")
++}
++
++// userFromProto converts a protocol.User (with account TypedMessage) into an
++// adapter.ManagedUser.
++func userFromProto(u *protocol.User) (adapter.ManagedUser, error) {
++	email := u.GetEmail()
++	acc := u.GetAccount()
++	if acc == nil {
++		// No account → password-style protocol; email carries the credential.
++		return adapter.ManagedUser{Name: email, UUID: email, Password: email}, nil
++	}
++	switch normalizeType(acc.Type) {
++	case accountTypeManagedUser:
++		return decodeManagedUser(acc.Value, email)
++	case accountTypeVLess:
++		var a vless.Account
++		if err := proto.Unmarshal(acc.Value, &a); err != nil {
++			return adapter.ManagedUser{}, err
++		}
++		return adapter.ManagedUser{Name: email, UUID: a.GetId(), Flow: a.GetFlow()}, nil
++	case accountTypeVMess:
++		var a vmess.Account
++		if err := proto.Unmarshal(acc.Value, &a); err != nil {
++			return adapter.ManagedUser{}, err
++		}
++		return adapter.ManagedUser{Name: email, UUID: a.GetId()}, nil
++	}
++	return adapter.ManagedUser{}, errors.New("unsupported account type: " + acc.Type)
++}
++
++// userToProto converts an adapter.ManagedUser into a protocol.User carrying a
++// ManagedUser account TypedMessage.
++func userToProto(u adapter.ManagedUser) *protocol.User {
++	return &protocol.User{
++		Email: u.Name,
++		Account: &serial.TypedMessage{
++			Type:  accountTypeManagedUser,
++			Value: encodeManagedUser(u),
++		},
++	}
++}
++
++// encodeManagedUser encodes {name=1,uuid=2,password=3,flow=4}.
++func encodeManagedUser(u adapter.ManagedUser) []byte {
++	b := make([]byte, 0, 64)
++	if u.Name != "" {
++		b = appendManagedField(b, 1, u.Name)
++	}
++	if u.UUID != "" {
++		b = appendManagedField(b, 2, u.UUID)
++	}
++	if u.Password != "" {
++		b = appendManagedField(b, 3, u.Password)
++	}
++	if u.Flow != "" {
++		b = appendManagedField(b, 4, u.Flow)
++	}
++	return b
++}
++
++func appendManagedField(b []byte, field protowire.Number, s string) []byte {
++	b = protowire.AppendTag(b, field, protowire.BytesType)
++	return protowire.AppendString(b, s)
++}
++
++func decodeManagedUser(v []byte, fallbackEmail string) (adapter.ManagedUser, error) {
++	var mu adapter.ManagedUser
++	mu.Name = fallbackEmail
++	for len(v) > 0 {
++		num, typ, n := protowire.ConsumeTag(v)
++		if n < 0 {
++			return mu, protowire.ParseError(n)
++		}
++		v = v[n:]
++		switch num {
++		case 1:
++			s, n := protowire.ConsumeString(v)
++			if n < 0 {
++				return mu, protowire.ParseError(n)
++			}
++			mu.Name = s
++			v = v[n:]
++		case 2:
++			s, n := protowire.ConsumeString(v)
++			if n < 0 {
++				return mu, protowire.ParseError(n)
++			}
++			mu.UUID = s
++			v = v[n:]
++		case 3:
++			s, n := protowire.ConsumeString(v)
++			if n < 0 {
++				return mu, protowire.ParseError(n)
++			}
++			mu.Password = s
++			v = v[n:]
++		case 4:
++			s, n := protowire.ConsumeString(v)
++			if n < 0 {
++				return mu, protowire.ParseError(n)
++			}
++			mu.Flow = s
++			v = v[n:]
++		default:
++			// skip unknown field
++			n := protowire.ConsumeFieldValue(num, typ, v)
++			if n < 0 {
++				return mu, protowire.ParseError(n)
++			}
++			v = v[n:]
++		}
++	}
++	return mu, nil
++}
+\ No newline at end of file
+diff --git a/experimental/v2rayapi/user_service_test.go b/experimental/v2rayapi/user_service_test.go
+new file mode 100644
+index 0000000..c2f112c
+--- /dev/null
++++ b/experimental/v2rayapi/user_service_test.go
+@@ -0,0 +1,154 @@
++package v2rayapi
++
++import (
++	"context"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	command "github.com/sagernet/sing-box/experimental/v2rayapi/xraypb/app/proxyman/command"
++	protocol "github.com/sagernet/sing-box/experimental/v2rayapi/xraypb/common/protocol"
++	serial "github.com/sagernet/sing-box/experimental/v2rayapi/xraypb/common/serial"
++	vless "github.com/sagernet/sing-box/experimental/v2rayapi/xraypb/proxy/vless"
++	"github.com/sagernet/sing-box/log"
++
++	"google.golang.org/protobuf/proto"
++)
++
++// mockInboundManager implements adapter.InboundManager minimal for tests.
++type mockInboundManager struct {
++	inbound adapter.Inbound
++}
++
++func (m *mockInboundManager) Inbounds() []adapter.Inbound { return []adapter.Inbound{m.inbound} }
++func (m *mockInboundManager) Get(tag string) (adapter.Inbound, bool) {
++	if m.inbound != nil && m.inbound.Tag() == tag {
++		return m.inbound, true
++	}
++	return nil, false
++}
++func (m *mockInboundManager) Remove(tag string) error { return nil }
++func (m *mockInboundManager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, inboundType string, options any) error {
++	return nil
++}
++func (m *mockInboundManager) Start(stage adapter.StartStage) error { return nil }
++func (m *mockInboundManager) Close() error                         { return nil }
++
++// mockInbound implements InboundUserManager (vless-like).
++type mockInbound struct {
++	tag   string
++	users []adapter.ManagedUser
++}
++
++func (h *mockInbound) Type() string                { return "vless" }
++func (h *mockInbound) Tag() string                 { return h.tag }
++func (h *mockInbound) Start(stage adapter.StartStage) error { return nil }
++func (h *mockInbound) Close() error                { return nil }
++func (h *mockInbound) UpdateUsers(users []adapter.ManagedUser) error {
++	h.users = users
++	return nil
++}
++func (h *mockInbound) Users() []adapter.ManagedUser { return h.users }
++
++func addOp(t *testing.T, email string, accType string, accVal []byte) *serial.TypedMessage {
++	t.Helper()
++	user := &protocol.User{Email: email}
++	if accType != "" {
++		user.Account = &serial.TypedMessage{Type: accType, Value: accVal}
++	}
++	opVal, err := proto.Marshal(&command.AddUserOperation{User: user})
++	if err != nil {
++		t.Fatalf("marshal AddUserOperation: %v", err)
++	}
++	return &serial.TypedMessage{Type: "xray.app.proxyman.command.AddUserOperation", Value: opVal}
++}
++
++func TestUserServiceAddRemove(t *testing.T) {
++	inb := &mockInbound{tag: "in1"}
++	svc := NewUserService(&mockInboundManager{inbound: inb})
++	ctx := context.Background()
++
++	// AddUser with official vless.Account
++	acc := &vless.Account{Id: "u1", Flow: "xtls-rprx-vision"}
++	accVal, _ := proto.Marshal(acc)
++	if _, err := svc.AlterInbound(ctx, &command.AlterInboundRequest{Tag: "in1", Operation: addOp(t, "a@b.c", "xray.proxy.vless.Account", accVal)}); err != nil {
++		t.Fatalf("AddUser: %v", err)
++	}
++	if len(inb.Users()) != 1 || inb.Users()[0].UUID != "u1" || inb.Users()[0].Flow != "xtls-rprx-vision" {
++		t.Fatalf("after add: %+v", inb.Users())
++	}
++
++	// GetInboundUsers round-trip
++	g, err := svc.GetInboundUsers(ctx, &command.GetInboundUserRequest{Tag: "in1"})
++	if err != nil {
++		t.Fatalf("GetInboundUsers: %v", err)
++	}
++	if len(g.Users) != 1 || g.Users[0].Email != "a@b.c" {
++		t.Fatalf("get users: %+v", g.Users)
++	}
++
++	// duplicate add → error
++	if _, err := svc.AlterInbound(ctx, &command.AlterInboundRequest{Tag: "in1", Operation: addOp(t, "a@b.c", "xray.proxy.vless.Account", accVal)}); err == nil {
++		t.Fatalf("duplicate add should fail")
++	}
++
++	// RemoveUser
++	rmVal, _ := proto.Marshal(&command.RemoveUserOperation{Email: "a@b.c"})
++	if _, err := svc.AlterInbound(ctx, &command.AlterInboundRequest{Tag: "in1", Operation: &serial.TypedMessage{Type: "xray.app.proxyman.command.RemoveUserOperation", Value: rmVal}}); err != nil {
++		t.Fatalf("RemoveUser: %v", err)
++	}
++	if len(inb.Users()) != 0 {
++		t.Fatalf("after remove: %+v", inb.Users())
++	}
++
++	// count
++	cnt, err := svc.GetInboundUsersCount(ctx, &command.GetInboundUserRequest{Tag: "in1"})
++	if err != nil {
++		t.Fatalf("count: %v", err)
++	}
++	if cnt.Count != 0 {
++		t.Fatalf("count=%d want 0", cnt.Count)
++	}
++}
++
++func TestUserServiceManagedUserAccount(t *testing.T) {
++	inb := &mockInbound{tag: "in2"}
++	svc := NewUserService(&mockInboundManager{inbound: inb})
++	ctx := context.Background()
++
++	// xboard.user.ManagedUser account: {name="n1", password="p1"}
++	mu := encodeManagedUser(adapter.ManagedUser{Name: "n1", Password: "p1"})
++	if _, err := svc.AlterInbound(ctx, &command.AlterInboundRequest{Tag: "in2", Operation: addOp(t, "n1", "xboard.user.ManagedUser", mu)}); err != nil {
++		t.Fatalf("AddUser managed: %v", err)
++	}
++	if len(inb.Users()) != 1 || inb.Users()[0].Name != "n1" || inb.Users()[0].Password != "p1" {
++		t.Fatalf("after managed add: %+v", inb.Users())
++	}
++
++	// roundtrip decode
++	decoded, err := decodeManagedUser(mu, "")
++	if err != nil {
++		t.Fatalf("decode: %v", err)
++	}
++	if decoded.Name != "n1" || decoded.Password != "p1" {
++		t.Fatalf("decoded: %+v", decoded)
++	}
++}
++
++func TestUserServiceErrors(t *testing.T) {
++	inb := &mockInbound{tag: "in3"}
++	svc := NewUserService(&mockInboundManager{inbound: inb})
++	ctx := context.Background()
++
++	// inbound not found
++	if _, err := svc.AlterInbound(ctx, &command.AlterInboundRequest{Tag: "missing", Operation: &serial.TypedMessage{}}); err == nil {
++		t.Fatalf("missing inbound should error")
++	}
++	// operation required
++	if _, err := svc.AlterInbound(ctx, &command.AlterInboundRequest{Tag: "in3", Operation: nil}); err == nil {
++		t.Fatalf("nil operation should error")
++	}
++	// unsupported op type
++	if _, err := svc.AlterInbound(ctx, &command.AlterInboundRequest{Tag: "in3", Operation: &serial.TypedMessage{Type: "x.y.Z", Value: []byte{}}}); err == nil {
++		t.Fatalf("unsupported op should error")
++	}
++}
+\ No newline at end of file
+diff --git a/experimental/v2rayapi/xraypb/app/proxyman/command/command.pb.go b/experimental/v2rayapi/xraypb/app/proxyman/command/command.pb.go
+new file mode 100644
+index 0000000..6b7eaed
+--- /dev/null
++++ b/experimental/v2rayapi/xraypb/app/proxyman/command/command.pb.go
+@@ -0,0 +1,494 @@
++// Code generated by protoc-gen-go. DO NOT EDIT.
++// versions:
++// 	protoc-gen-go v1.36.11
++// 	protoc        v3.12.4
++// source: app/proxyman/command/command.proto
++
++package proxymancommand
++
++import (
++	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
++	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
++	xrayprotocol "github.com/sagernet/sing-box/experimental/v2rayapi/xraypb/common/protocol"
++	xrayserial "github.com/sagernet/sing-box/experimental/v2rayapi/xraypb/common/serial"
++	reflect "reflect"
++	sync "sync"
++	unsafe "unsafe"
++)
++
++const (
++	// Verify that this generated code is sufficiently up-to-date.
++	_ = protoimpl.EnforceVersion(20 - protoimpl.MinVersion)
++	// Verify that runtime/protoimpl is sufficiently up-to-date.
++	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
++)
++
++// AddUserOperation adds a user to an inbound via AlterInbound.
++type AddUserOperation struct {
++	state protoimpl.MessageState `protogen:"open.v1"`
++	User *xrayprotocol.User `protobuf:"bytes,1,opt,name=user,proto3" json:"user,omitempty"`
++	unknownFields protoimpl.UnknownFields
++	sizeCache protoimpl.SizeCache
++}
++
++func (x *AddUserOperation) Reset() {
++	*x = AddUserOperation{}
++	mi := &file_app_proxyman_command_command_proto_msgTypes[0]
++	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++	ms.StoreMessageInfo(mi)
++}
++
++func (x *AddUserOperation) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*AddUserOperation) ProtoMessage() {}
++
++func (x *AddUserOperation) ProtoReflect() protoreflect.Message {
++	mi := &file_app_proxyman_command_command_proto_msgTypes[0]
++	if x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use AddUserOperation.ProtoReflect.Descriptor instead.
++func (*AddUserOperation) Descriptor() ([]byte, []int) {
++	return file_app_proxyman_command_command_proto_rawDescGZIP(), []int{0}
++}
++
++func (x *AddUserOperation) GetUser() *xrayprotocol.User {
++	if x != nil {
++		return x.User
++	}
++	return nil
++}
++
++// RemoveUserOperation removes a user from an inbound via AlterInbound.
++type RemoveUserOperation struct {
++	state protoimpl.MessageState `protogen:"open.v1"`
++	Email string `protobuf:"bytes,1,opt,name=email,proto3" json:"email,omitempty"`
++	unknownFields protoimpl.UnknownFields
++	sizeCache protoimpl.SizeCache
++}
++
++func (x *RemoveUserOperation) Reset() {
++	*x = RemoveUserOperation{}
++	mi := &file_app_proxyman_command_command_proto_msgTypes[1]
++	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++	ms.StoreMessageInfo(mi)
++}
++
++func (x *RemoveUserOperation) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*RemoveUserOperation) ProtoMessage() {}
++
++func (x *RemoveUserOperation) ProtoReflect() protoreflect.Message {
++	mi := &file_app_proxyman_command_command_proto_msgTypes[1]
++	if x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use RemoveUserOperation.ProtoReflect.Descriptor instead.
++func (*RemoveUserOperation) Descriptor() ([]byte, []int) {
++	return file_app_proxyman_command_command_proto_rawDescGZIP(), []int{1}
++}
++
++func (x *RemoveUserOperation) GetEmail() string {
++	if x != nil {
++		return x.Email
++	}
++	return ""
++}
++
++// AlterInboundRequest alters an inbound by tag with a TypedMessage operation.
++type AlterInboundRequest struct {
++	state protoimpl.MessageState `protogen:"open.v1"`
++	Tag string `protobuf:"bytes,1,opt,name=tag,proto3" json:"tag,omitempty"`
++	Operation *xrayserial.TypedMessage `protobuf:"bytes,2,opt,name=operation,proto3" json:"operation,omitempty"`
++	unknownFields protoimpl.UnknownFields
++	sizeCache protoimpl.SizeCache
++}
++
++func (x *AlterInboundRequest) Reset() {
++	*x = AlterInboundRequest{}
++	mi := &file_app_proxyman_command_command_proto_msgTypes[2]
++	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++	ms.StoreMessageInfo(mi)
++}
++
++func (x *AlterInboundRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*AlterInboundRequest) ProtoMessage() {}
++
++func (x *AlterInboundRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_app_proxyman_command_command_proto_msgTypes[2]
++	if x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use AlterInboundRequest.ProtoReflect.Descriptor instead.
++func (*AlterInboundRequest) Descriptor() ([]byte, []int) {
++	return file_app_proxyman_command_command_proto_rawDescGZIP(), []int{2}
++}
++
++func (x *AlterInboundRequest) GetTag() string {
++	if x != nil {
++		return x.Tag
++	}
++	return ""
++}
++
++func (x *AlterInboundRequest) GetOperation() *xrayserial.TypedMessage {
++	if x != nil {
++		return x.Operation
++	}
++	return nil
++}
++
++// AlterInboundResponse is the response to AlterInbound.
++type AlterInboundResponse struct {
++	unknownFields protoimpl.UnknownFields
++	sizeCache protoimpl.SizeCache
++}
++
++func (x *AlterInboundResponse) Reset() {
++	*x = AlterInboundResponse{}
++	mi := &file_app_proxyman_command_command_proto_msgTypes[3]
++	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++	ms.StoreMessageInfo(mi)
++}
++
++func (x *AlterInboundResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*AlterInboundResponse) ProtoMessage() {}
++
++func (x *AlterInboundResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_app_proxyman_command_command_proto_msgTypes[3]
++	if x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use AlterInboundResponse.ProtoReflect.Descriptor instead.
++func (*AlterInboundResponse) Descriptor() ([]byte, []int) {
++	return file_app_proxyman_command_command_proto_rawDescGZIP(), []int{3}
++}
++
++// GetInboundUserRequest lists users by (tag, email).
++type GetInboundUserRequest struct {
++	state protoimpl.MessageState `protogen:"open.v1"`
++	Tag string `protobuf:"bytes,1,opt,name=tag,proto3" json:"tag,omitempty"`
++	Email string `protobuf:"bytes,2,opt,name=email,proto3" json:"email,omitempty"`
++	unknownFields protoimpl.UnknownFields
++	sizeCache protoimpl.SizeCache
++}
++
++func (x *GetInboundUserRequest) Reset() {
++	*x = GetInboundUserRequest{}
++	mi := &file_app_proxyman_command_command_proto_msgTypes[4]
++	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++	ms.StoreMessageInfo(mi)
++}
++
++func (x *GetInboundUserRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*GetInboundUserRequest) ProtoMessage() {}
++
++func (x *GetInboundUserRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_app_proxyman_command_command_proto_msgTypes[4]
++	if x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use GetInboundUserRequest.ProtoReflect.Descriptor instead.
++func (*GetInboundUserRequest) Descriptor() ([]byte, []int) {
++	return file_app_proxyman_command_command_proto_rawDescGZIP(), []int{4}
++}
++
++func (x *GetInboundUserRequest) GetTag() string {
++	if x != nil {
++		return x.Tag
++	}
++	return ""
++}
++
++func (x *GetInboundUserRequest) GetEmail() string {
++	if x != nil {
++		return x.Email
++	}
++	return ""
++}
++
++// GetInboundUserResponse returns a list of inbound users.
++type GetInboundUserResponse struct {
++	state protoimpl.MessageState `protogen:"open.v1"`
++	Users []*xrayprotocol.User `protobuf:"bytes,1,rep,name=users,proto3" json:"users,omitempty"`
++	unknownFields protoimpl.UnknownFields
++	sizeCache protoimpl.SizeCache
++}
++
++func (x *GetInboundUserResponse) Reset() {
++	*x = GetInboundUserResponse{}
++	mi := &file_app_proxyman_command_command_proto_msgTypes[5]
++	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++	ms.StoreMessageInfo(mi)
++}
++
++func (x *GetInboundUserResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*GetInboundUserResponse) ProtoMessage() {}
++
++func (x *GetInboundUserResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_app_proxyman_command_command_proto_msgTypes[5]
++	if x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use GetInboundUserResponse.ProtoReflect.Descriptor instead.
++func (*GetInboundUserResponse) Descriptor() ([]byte, []int) {
++	return file_app_proxyman_command_command_proto_rawDescGZIP(), []int{5}
++}
++
++func (x *GetInboundUserResponse) GetUsers() []*xrayprotocol.User {
++	if x != nil {
++		return x.Users
++	}
++	return nil
++}
++
++// GetInboundUsersCountResponse returns the number of inbound users.
++type GetInboundUsersCountResponse struct {
++	state protoimpl.MessageState `protogen:"open.v1"`
++	Count int64 `protobuf:"varint,1,opt,name=count,proto3" json:"count,omitempty"`
++	unknownFields protoimpl.UnknownFields
++	sizeCache protoimpl.SizeCache
++}
++
++func (x *GetInboundUsersCountResponse) Reset() {
++	*x = GetInboundUsersCountResponse{}
++	mi := &file_app_proxyman_command_command_proto_msgTypes[6]
++	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++	ms.StoreMessageInfo(mi)
++}
++
++func (x *GetInboundUsersCountResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*GetInboundUsersCountResponse) ProtoMessage() {}
++
++func (x *GetInboundUsersCountResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_app_proxyman_command_command_proto_msgTypes[6]
++	if x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use GetInboundUsersCountResponse.ProtoReflect.Descriptor instead.
++func (*GetInboundUsersCountResponse) Descriptor() ([]byte, []int) {
++	return file_app_proxyman_command_command_proto_rawDescGZIP(), []int{6}
++}
++
++func (x *GetInboundUsersCountResponse) GetCount() int64 {
++	if x != nil {
++		return x.Count
++	}
++	return 0
++}
++
++var File_app_proxyman_command_command_proto protoreflect.FileDescriptor
++
++const file_app_proxyman_command_command_proto_rawDesc = "" +
++	"\n\"app/proxyman" +
++	"/command/comma" +
++	"nd.proto\x12\x19xray" +
++	".app.proxyman." +
++	"command\x1a\x1acommo" +
++	"n/protocol/use" +
++	"r.proto\x1a!commo" +
++	"n/serial/typed" +
++	"_message.proto" +
++	"\"B\n\x10AddUserOpe" +
++	"ration\x12.\n\x04user" +
++	"\x18\x01 \x01(\x0b2\x1a.xray." +
++	"common.protoco" +
++	"l.UserR\x04user\"+" +
++	"\n\x13RemoveUserOp" +
++	"eration\x12\x14\n\x05ema" +
++	"il\x18\x01 \x01(\tR\x05emai" +
++	"l\"g\n\x13AlterInbo" +
++	"undRequest\x12\x10\n\x03" +
++	"tag\x18\x01 \x01(\tR\x03tag" +
++	"\x12>\n\toperation\x18" +
++	"\x02 \x01(\x0b2 .xray.c" +
++	"ommon.serial.T" +
++	"ypedMessageR\to" +
++	"peration\"\x16\n\x14Al" +
++	"terInboundResp" +
++	"onse\"?\n\x15GetInb" +
++	"oundUserReques" +
++	"t\x12\x10\n\x03tag\x18\x01 \x01(\t" +
++	"R\x03tag\x12\x14\n\x05email" +
++	"\x18\x02 \x01(\tR\x05email\"" +
++	"J\n\x16GetInboundU" +
++	"serResponse\x120\n" +
++	"\x05users\x18\x01 \x03(\x0b2\x1a" +
++	".xray.common.p" +
++	"rotocol.UserR\x05" +
++	"users\"4\n\x1cGetIn" +
++	"boundUsersCoun" +
++	"tResponse\x12\x14\n\x05c" +
++	"ount\x18\x01 \x01(\x03R\x05co" +
++	"unt2\xfd\x02\n\x0eHandle" +
++	"rService\x12o\n\x0cAl" +
++	"terInbound\x12..x" +
++	"ray.app.proxym" +
++	"an.command.Alt" +
++	"erInboundReque" +
++	"st\x1a/.xray.app." +
++	"proxyman.comma" +
++	"nd.AlterInboun" +
++	"dResponse\x12v\n\x0fG" +
++	"etInboundUsers" +
++	"\x120.xray.app.pr" +
++	"oxyman.command" +
++	".GetInboundUse" +
++	"rRequest\x1a1.xra" +
++	"y.app.proxyman" +
++	".command.GetIn" +
++	"boundUserRespo" +
++	"nse\x12\x81\x01\n\x14GetInb" +
++	"oundUsersCount" +
++	"\x120.xray.app.pr" +
++	"oxyman.command" +
++	".GetInboundUse" +
++	"rRequest\x1a7.xra" +
++	"y.app.proxyman" +
++	".command.GetIn" +
++	"boundUsersCoun" +
++	"tResponseBCZAg" +
++	"ithub.com/crea" +
++	"mcroissant/xbo" +
++	"ard/pkg/pb/xra" +
++	"y/app/proxyman" +
++	"/commandb\x06prot" +
++	"o3"
++
++var (
++	file_app_proxyman_command_command_proto_rawDescOnce sync.Once
++	file_app_proxyman_command_command_proto_rawDescData []byte
++)
++
++func file_app_proxyman_command_command_proto_rawDescGZIP() []byte {
++	file_app_proxyman_command_command_proto_rawDescOnce.Do(func() {
++		file_app_proxyman_command_command_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_app_proxyman_command_command_proto_rawDesc), len(file_app_proxyman_command_command_proto_rawDesc)))
++	})
++	return file_app_proxyman_command_command_proto_rawDescData
++}
++
++
++var file_app_proxyman_command_command_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
++
++
++var file_app_proxyman_command_command_proto_goTypes = []any{
++	(*AddUserOperation)(nil), // 0: proxymancommand.AddUserOperation
++	(*RemoveUserOperation)(nil), // 1: proxymancommand.RemoveUserOperation
++	(*AlterInboundRequest)(nil), // 2: proxymancommand.AlterInboundRequest
++	(*AlterInboundResponse)(nil), // 3: proxymancommand.AlterInboundResponse
++	(*GetInboundUserRequest)(nil), // 4: proxymancommand.GetInboundUserRequest
++	(*GetInboundUserResponse)(nil), // 5: proxymancommand.GetInboundUserResponse
++	(*GetInboundUsersCountResponse)(nil), // 6: proxymancommand.GetInboundUsersCountResponse
++	(*xrayprotocol.User)(nil), // 7: xrayprotocol.User
++	(*xrayserial.TypedMessage)(nil), // 8: xrayserial.TypedMessage
++}
++var file_app_proxyman_command_command_proto_depIdxs = []int32{
++	7, // 0: proxymancommand.AddUserOperation.User:type_name -> xrayprotocol.User
++	8, // 1: proxymancommand.AlterInboundRequest.Operation:type_name -> xrayserial.TypedMessage
++	7, // 2: proxymancommand.GetInboundUserResponse.Users:type_name -> xrayprotocol.User
++	2, // 3: proxymancommand.HandlerService.AlterInbound:input_type -> proxymancommand.AlterInboundRequest
++	4, // 4: proxymancommand.HandlerService.GetInboundUsers:input_type -> proxymancommand.GetInboundUserRequest
++	4, // 5: proxymancommand.HandlerService.GetInboundUsersCount:input_type -> proxymancommand.GetInboundUserRequest
++	3, // 6: proxymancommand.HandlerService.AlterInbound:output_type -> proxymancommand.AlterInboundResponse
++	5, // 7: proxymancommand.HandlerService.GetInboundUsers:output_type -> proxymancommand.GetInboundUserResponse
++	6, // 8: proxymancommand.HandlerService.GetInboundUsersCount:output_type -> proxymancommand.GetInboundUsersCountResponse
++	6, // [6:9] is the sub-list for method output_type
++	3, // [3:6] is the sub-list for method input_type
++	3, // [3:3] is the sub-list for extension type_name
++	3, // [3:3] is the sub-list for extension extendee
++	0, // [0:3] is the sub-list for field type_name
++}
++
++
++func init() { file_app_proxyman_command_command_proto_init() }
++func file_app_proxyman_command_command_proto_init() {
++	if File_app_proxyman_command_command_proto != nil {
++		return
++	}
++	type x struct{}
++	out := protoimpl.TypeBuilder{
++		File: protoimpl.DescBuilder{
++			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
++			RawDescriptor: unsafe.Slice(unsafe.StringData(file_app_proxyman_command_command_proto_rawDesc), len(file_app_proxyman_command_command_proto_rawDesc)),
++			NumEnums:      0,
++			NumMessages:   7,
++			NumExtensions: 0,
++			NumServices:   1,
++		},
++		GoTypes:           file_app_proxyman_command_command_proto_goTypes,
++		DependencyIndexes: file_app_proxyman_command_command_proto_depIdxs,
++		MessageInfos:      file_app_proxyman_command_command_proto_msgTypes,
++	}.Build()
++	File_app_proxyman_command_command_proto = out.File
++	file_app_proxyman_command_command_proto_goTypes = nil
++	file_app_proxyman_command_command_proto_depIdxs = nil
++}
++
+diff --git a/experimental/v2rayapi/xraypb/app/proxyman/command/command_grpc.pb.go b/experimental/v2rayapi/xraypb/app/proxyman/command/command_grpc.pb.go
+new file mode 100644
+index 0000000..9db1000
+--- /dev/null
++++ b/experimental/v2rayapi/xraypb/app/proxyman/command/command_grpc.pb.go
+@@ -0,0 +1,207 @@
++// Code generated by protoc-gen-go-grpc. DO NOT EDIT.
++// versions:
++// - protoc-gen-go-grpc v1.6.0
++// - protoc             v3.12.4
++// source: app/proxyman/command/command.proto
++
++package proxymancommand
++
++import (
++	context "context"
++	grpc "google.golang.org/grpc"
++	codes "google.golang.org/grpc/codes"
++	status "google.golang.org/grpc/status"
++)
++
++// This is a compile-time assertion to ensure that this generated file
++// is compatible with the grpc package it is being compiled against.
++// Requires gRPC-Go v1.64.0 or later.
++const _ = grpc.SupportPackageIsVersion9
++
++const (
++	HandlerService_AlterInbound_FullMethodName              = "/xray.app.proxyman.command.HandlerService/AlterInbound"
++	HandlerService_GetInboundUsers_FullMethodName           = "/xray.app.proxyman.command.HandlerService/GetInboundUsers"
++	HandlerService_GetInboundUsersCount_FullMethodName      = "/xray.app.proxyman.command.HandlerService/GetInboundUsersCount"
++)
++
++// HandlerServiceClient is the client API for HandlerService service.
++//
++// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
++//
++// HandlerService is the proxyman command service for mutating inbounds/outbounds.
++type HandlerServiceClient interface {
++	// AlterInbound applies an operation (e.g. AddUserOperation/RemoveUserOperation) to an inbound.
++	AlterInbound(ctx context.Context, in *AlterInboundRequest, opts ...grpc.CallOption) (*AlterInboundResponse, error)
++	// GetInboundUsers lists users of an inbound.
++	GetInboundUsers(ctx context.Context, in *GetInboundUserRequest, opts ...grpc.CallOption) (*GetInboundUserResponse, error)
++	// GetInboundUsersCount returns the user count of an inbound.
++	GetInboundUsersCount(ctx context.Context, in *GetInboundUserRequest, opts ...grpc.CallOption) (*GetInboundUsersCountResponse, error)
++}
++
++type handlerServiceClient struct {
++	cc grpc.ClientConnInterface
++}
++
++func NewHandlerServiceClient(cc grpc.ClientConnInterface) HandlerServiceClient {
++	return &handlerServiceClient{cc}
++}
++
++func (c *handlerServiceClient) AlterInbound(ctx context.Context, in *AlterInboundRequest, opts ...grpc.CallOption) (*AlterInboundResponse, error) {
++	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
++	out := new(AlterInboundResponse)
++	err := c.cc.Invoke(ctx, HandlerService_AlterInbound_FullMethodName, in, out, cOpts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *handlerServiceClient) GetInboundUsers(ctx context.Context, in *GetInboundUserRequest, opts ...grpc.CallOption) (*GetInboundUserResponse, error) {
++	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
++	out := new(GetInboundUserResponse)
++	err := c.cc.Invoke(ctx, HandlerService_GetInboundUsers_FullMethodName, in, out, cOpts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *handlerServiceClient) GetInboundUsersCount(ctx context.Context, in *GetInboundUserRequest, opts ...grpc.CallOption) (*GetInboundUsersCountResponse, error) {
++	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
++	out := new(GetInboundUsersCountResponse)
++	err := c.cc.Invoke(ctx, HandlerService_GetInboundUsersCount_FullMethodName, in, out, cOpts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++// HandlerServiceServer is the server API for HandlerService service.
++// All implementations must embed UnimplementedHandlerServiceServer
++// for forward compatibility.
++//
++// HandlerService is the proxyman command service for mutating inbounds/outbounds.
++type HandlerServiceServer interface {
++	// AlterInbound applies an operation (e.g. AddUserOperation/RemoveUserOperation) to an inbound.
++	AlterInbound(context.Context, *AlterInboundRequest) (*AlterInboundResponse, error)
++	// GetInboundUsers lists users of an inbound.
++	GetInboundUsers(context.Context, *GetInboundUserRequest) (*GetInboundUserResponse, error)
++	// GetInboundUsersCount returns the user count of an inbound.
++	GetInboundUsersCount(context.Context, *GetInboundUserRequest) (*GetInboundUsersCountResponse, error)
++	mustEmbedUnimplementedHandlerServiceServer()
++}
++
++// UnimplementedHandlerServiceServer must be embedded to have
++// forward compatible implementations.
++//
++// NOTE: this should be embedded by value instead of pointer to avoid a nil
++// pointer dereference when methods are called.
++type UnimplementedHandlerServiceServer struct{}
++
++func (UnimplementedHandlerServiceServer) AlterInbound(context.Context, *AlterInboundRequest) (*AlterInboundResponse, error) {
++	return nil, status.Error(codes.Unimplemented, "method AlterInbound not implemented")
++}
++func (UnimplementedHandlerServiceServer) GetInboundUsers(context.Context, *GetInboundUserRequest) (*GetInboundUserResponse, error) {
++	return nil, status.Error(codes.Unimplemented, "method GetInboundUsers not implemented")
++}
++func (UnimplementedHandlerServiceServer) GetInboundUsersCount(context.Context, *GetInboundUserRequest) (*GetInboundUsersCountResponse, error) {
++	return nil, status.Error(codes.Unimplemented, "method GetInboundUsersCount not implemented")
++}
++func (UnimplementedHandlerServiceServer) mustEmbedUnimplementedHandlerServiceServer() {}
++func (UnimplementedHandlerServiceServer) testEmbeddedByValue()                      {}
++
++// UnsafeHandlerServiceServer may be embedded to opt out of forward compatibility for this service.
++// Use of this interface is not recommended, as added methods to HandlerServiceServer will
++// result in compilation errors.
++type UnsafeHandlerServiceServer interface {
++	mustEmbedUnimplementedHandlerServiceServer()
++}
++
++func RegisterHandlerServiceServer(s grpc.ServiceRegistrar, srv HandlerServiceServer) {
++	// If the following call panics, it indicates UnimplementedHandlerServiceServer was
++	// embedded by pointer and is nil.  This will cause panics if an
++	// unimplemented method is ever invoked, so we test this at initialization
++	// time to prevent it from happening at runtime later due to I/O.
++	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
++		t.testEmbeddedByValue()
++	}
++	s.RegisterService(&HandlerService_ServiceDesc, srv)
++}
++
++func _HandlerService_AlterInbound_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(AlterInboundRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(HandlerServiceServer).AlterInbound(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: HandlerService_AlterInbound_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(HandlerServiceServer).AlterInbound(ctx, req.(*AlterInboundRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _HandlerService_GetInboundUsers_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(GetInboundUserRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(HandlerServiceServer).GetInboundUsers(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: HandlerService_GetInboundUsers_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(HandlerServiceServer).GetInboundUsers(ctx, req.(*GetInboundUserRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _HandlerService_GetInboundUsersCount_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(GetInboundUserRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(HandlerServiceServer).GetInboundUsersCount(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: HandlerService_GetInboundUsersCount_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(HandlerServiceServer).GetInboundUsersCount(ctx, req.(*GetInboundUserRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++// HandlerService_ServiceDesc is the grpc.ServiceDesc for HandlerService service.
++// It's only intended for direct use with grpc.RegisterService,
++// and not to be introspected or modified (even as a copy)
++var HandlerService_ServiceDesc = grpc.ServiceDesc{
++	ServiceName: "xray.app.proxyman.command.HandlerService",
++	HandlerType: (*HandlerServiceServer)(nil),
++	Methods: []grpc.MethodDesc{
++		{
++			MethodName: "AlterInbound",
++			Handler:    _HandlerService_AlterInbound_Handler,
++		},
++		{
++			MethodName: "GetInboundUsers",
++			Handler:    _HandlerService_GetInboundUsers_Handler,
++		},
++		{
++			MethodName: "GetInboundUsersCount",
++			Handler:    _HandlerService_GetInboundUsersCount_Handler,
++		},
++	},
++	Streams:  []grpc.StreamDesc{},
++	Metadata: "app/proxyman/command/command.proto",
++}
+\ No newline at end of file
+diff --git a/experimental/v2rayapi/xraypb/common/protocol/user.pb.go b/experimental/v2rayapi/xraypb/common/protocol/user.pb.go
+new file mode 100644
+index 0000000..43f09a7
+--- /dev/null
++++ b/experimental/v2rayapi/xraypb/common/protocol/user.pb.go
+@@ -0,0 +1,163 @@
++// Code generated by protoc-gen-go. DO NOT EDIT.
++// versions:
++// 	protoc-gen-go v1.36.11
++// 	protoc        v3.12.4
++// source: common/protocol/user.proto
++
++package xrayprotocol
++
++import (
++	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
++	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
++	xrayserial "github.com/sagernet/sing-box/experimental/v2rayapi/xraypb/common/serial"
++	reflect "reflect"
++	sync "sync"
++	unsafe "unsafe"
++)
++
++const (
++	// Verify that this generated code is sufficiently up-to-date.
++	_ = protoimpl.EnforceVersion(20 - protoimpl.MinVersion)
++	// Verify that runtime/protoimpl is sufficiently up-to-date.
++	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
++)
++
++// User is a generic user for all protocols.
++type User struct {
++	state protoimpl.MessageState `protogen:"open.v1"`
++	Level uint32 `protobuf:"varint,1,opt,name=level,proto3" json:"level,omitempty"`
++	Email string `protobuf:"bytes,2,opt,name=email,proto3" json:"email,omitempty"`
++	Account *xrayserial.TypedMessage `protobuf:"bytes,3,opt,name=account,proto3" json:"account,omitempty"`
++	unknownFields protoimpl.UnknownFields
++	sizeCache protoimpl.SizeCache
++}
++
++func (x *User) Reset() {
++	*x = User{}
++	mi := &file_common_protocol_user_proto_msgTypes[0]
++	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++	ms.StoreMessageInfo(mi)
++}
++
++func (x *User) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*User) ProtoMessage() {}
++
++func (x *User) ProtoReflect() protoreflect.Message {
++	mi := &file_common_protocol_user_proto_msgTypes[0]
++	if x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use User.ProtoReflect.Descriptor instead.
++func (*User) Descriptor() ([]byte, []int) {
++	return file_common_protocol_user_proto_rawDescGZIP(), []int{0}
++}
++
++func (x *User) GetLevel() uint32 {
++	if x != nil {
++		return x.Level
++	}
++	return 0
++}
++
++func (x *User) GetEmail() string {
++	if x != nil {
++		return x.Email
++	}
++	return ""
++}
++
++func (x *User) GetAccount() *xrayserial.TypedMessage {
++	if x != nil {
++		return x.Account
++	}
++	return nil
++}
++
++var File_common_protocol_user_proto protoreflect.FileDescriptor
++
++const file_common_protocol_user_proto_rawDesc = "" +
++	"\n\x1acommon/proto" +
++	"col/user.proto" +
++	"\x12\x14xray.common." +
++	"protocol\x1a!comm" +
++	"on/serial/type" +
++	"d_message.prot" +
++	"o\"n\n\x04User\x12\x14\n\x05l" +
++	"evel\x18\x01 \x01(\x0dR\x05le" +
++	"vel\x12\x14\n\x05email\x18\x02" +
++	" \x01(\tR\x05email\x12:\n" +
++	"\x07account\x18\x03 \x01(\x0b" +
++	"2 .xray.common" +
++	".serial.TypedM" +
++	"essageR\x07accoun" +
++	"tB>Z<github.co" +
++	"m/creamcroissa" +
++	"nt/xboard/pkg/" +
++	"pb/xray/common" +
++	"/protocolb\x06pro" +
++	"to3"
++
++var (
++	file_common_protocol_user_proto_rawDescOnce sync.Once
++	file_common_protocol_user_proto_rawDescData []byte
++)
++
++func file_common_protocol_user_proto_rawDescGZIP() []byte {
++	file_common_protocol_user_proto_rawDescOnce.Do(func() {
++		file_common_protocol_user_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_common_protocol_user_proto_rawDesc), len(file_common_protocol_user_proto_rawDesc)))
++	})
++	return file_common_protocol_user_proto_rawDescData
++}
++
++
++var file_common_protocol_user_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
++
++
++var file_common_protocol_user_proto_goTypes = []any{
++	(*User)(nil), // 0: xrayprotocol.User
++	(*xrayserial.TypedMessage)(nil), // 1: xrayserial.TypedMessage
++}
++var file_common_protocol_user_proto_depIdxs = []int32{
++	1, // 0: xrayprotocol.User.Account:type_name -> xrayserial.TypedMessage
++	0, // [0:0] is the sub-list for method output_type
++	0, // [0:0] is the sub-list for method input_type
++	0, // [0:0] is the sub-list for extension type_name
++	0, // [0:0] is the sub-list for extension extendee
++	0, // [0:0] is the sub-list for field type_name
++}
++
++
++func init() { file_common_protocol_user_proto_init() }
++func file_common_protocol_user_proto_init() {
++	if File_common_protocol_user_proto != nil {
++		return
++	}
++	type x struct{}
++	out := protoimpl.TypeBuilder{
++		File: protoimpl.DescBuilder{
++			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
++			RawDescriptor: unsafe.Slice(unsafe.StringData(file_common_protocol_user_proto_rawDesc), len(file_common_protocol_user_proto_rawDesc)),
++			NumEnums:      0,
++			NumMessages:   1,
++			NumExtensions: 0,
++			NumServices:   0,
++		},
++		GoTypes:           file_common_protocol_user_proto_goTypes,
++		DependencyIndexes: file_common_protocol_user_proto_depIdxs,
++		MessageInfos:      file_common_protocol_user_proto_msgTypes,
++	}.Build()
++	File_common_protocol_user_proto = out.File
++	file_common_protocol_user_proto_goTypes = nil
++	file_common_protocol_user_proto_depIdxs = nil
++}
++
+diff --git a/experimental/v2rayapi/xraypb/common/serial/typed_message.pb.go b/experimental/v2rayapi/xraypb/common/serial/typed_message.pb.go
+new file mode 100644
+index 0000000..9c6294b
+--- /dev/null
++++ b/experimental/v2rayapi/xraypb/common/serial/typed_message.pb.go
+@@ -0,0 +1,146 @@
++// Code generated by protoc-gen-go. DO NOT EDIT.
++// versions:
++// 	protoc-gen-go v1.36.11
++// 	protoc        v3.12.4
++// source: common/serial/typed_message.proto
++
++package xrayserial
++
++import (
++	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
++	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
++	reflect "reflect"
++	sync "sync"
++	unsafe "unsafe"
++)
++
++const (
++	// Verify that this generated code is sufficiently up-to-date.
++	_ = protoimpl.EnforceVersion(20 - protoimpl.MinVersion)
++	// Verify that runtime/protoimpl is sufficiently up-to-date.
++	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
++)
++
++// TypedMessage is a serialized proto message along with its type name.
++type TypedMessage struct {
++	state protoimpl.MessageState `protogen:"open.v1"`
++	Type string `protobuf:"bytes,1,opt,name=type,proto3" json:"type,omitempty"`
++	Value []byte `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
++	unknownFields protoimpl.UnknownFields
++	sizeCache protoimpl.SizeCache
++}
++
++func (x *TypedMessage) Reset() {
++	*x = TypedMessage{}
++	mi := &file_common_serial_typed_message_proto_msgTypes[0]
++	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++	ms.StoreMessageInfo(mi)
++}
++
++func (x *TypedMessage) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*TypedMessage) ProtoMessage() {}
++
++func (x *TypedMessage) ProtoReflect() protoreflect.Message {
++	mi := &file_common_serial_typed_message_proto_msgTypes[0]
++	if x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use TypedMessage.ProtoReflect.Descriptor instead.
++func (*TypedMessage) Descriptor() ([]byte, []int) {
++	return file_common_serial_typed_message_proto_rawDescGZIP(), []int{0}
++}
++
++func (x *TypedMessage) GetType() string {
++	if x != nil {
++		return x.Type
++	}
++	return ""
++}
++
++func (x *TypedMessage) GetValue() []byte {
++	if x != nil {
++		return x.Value
++	}
++	return nil
++}
++
++var File_common_serial_typed_message_proto protoreflect.FileDescriptor
++
++const file_common_serial_typed_message_proto_rawDesc = "" +
++	"\n!common/seria" +
++	"l/typed_messag" +
++	"e.proto\x12\x12xray." +
++	"common.serial\"" +
++	"8\n\x0cTypedMessag" +
++	"e\x12\x12\n\x04type\x18\x01 \x01(" +
++	"\tR\x04type\x12\x14\n\x05val" +
++	"ue\x18\x02 \x01(\x0cR\x05valu" +
++	"eB<Z:github.co" +
++	"m/creamcroissa" +
++	"nt/xboard/pkg/" +
++	"pb/xray/common" +
++	"/serialb\x06proto" +
++	"3"
++
++var (
++	file_common_serial_typed_message_proto_rawDescOnce sync.Once
++	file_common_serial_typed_message_proto_rawDescData []byte
++)
++
++func file_common_serial_typed_message_proto_rawDescGZIP() []byte {
++	file_common_serial_typed_message_proto_rawDescOnce.Do(func() {
++		file_common_serial_typed_message_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_common_serial_typed_message_proto_rawDesc), len(file_common_serial_typed_message_proto_rawDesc)))
++	})
++	return file_common_serial_typed_message_proto_rawDescData
++}
++
++
++var file_common_serial_typed_message_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
++
++
++var file_common_serial_typed_message_proto_goTypes = []any{
++	(*TypedMessage)(nil), // 0: xrayserial.TypedMessage
++}
++var file_common_serial_typed_message_proto_depIdxs = []int32{
++	0, // [0:0] is the sub-list for method output_type
++	0, // [0:0] is the sub-list for method input_type
++	0, // [0:0] is the sub-list for extension type_name
++	0, // [0:0] is the sub-list for extension extendee
++	0, // [0:0] is the sub-list for field type_name
++}
++
++
++func init() { file_common_serial_typed_message_proto_init() }
++func file_common_serial_typed_message_proto_init() {
++	if File_common_serial_typed_message_proto != nil {
++		return
++	}
++	type x struct{}
++	out := protoimpl.TypeBuilder{
++		File: protoimpl.DescBuilder{
++			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
++			RawDescriptor: unsafe.Slice(unsafe.StringData(file_common_serial_typed_message_proto_rawDesc), len(file_common_serial_typed_message_proto_rawDesc)),
++			NumEnums:      0,
++			NumMessages:   1,
++			NumExtensions: 0,
++			NumServices:   0,
++		},
++		GoTypes:           file_common_serial_typed_message_proto_goTypes,
++		DependencyIndexes: file_common_serial_typed_message_proto_depIdxs,
++		MessageInfos:      file_common_serial_typed_message_proto_msgTypes,
++	}.Build()
++	File_common_serial_typed_message_proto = out.File
++	file_common_serial_typed_message_proto_goTypes = nil
++	file_common_serial_typed_message_proto_depIdxs = nil
++}
++
+diff --git a/experimental/v2rayapi/xraypb/proxy/vless/account.pb.go b/experimental/v2rayapi/xraypb/proxy/vless/account.pb.go
+new file mode 100644
+index 0000000..4bd63ea
+--- /dev/null
++++ b/experimental/v2rayapi/xraypb/proxy/vless/account.pb.go
+@@ -0,0 +1,154 @@
++// Code generated by protoc-gen-go. DO NOT EDIT.
++// versions:
++// 	protoc-gen-go v1.36.11
++// 	protoc        v3.12.4
++// source: proxy/vless/account.proto
++
++package xrayvless
++
++import (
++	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
++	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
++	reflect "reflect"
++	sync "sync"
++	unsafe "unsafe"
++)
++
++const (
++	// Verify that this generated code is sufficiently up-to-date.
++	_ = protoimpl.EnforceVersion(20 - protoimpl.MinVersion)
++	// Verify that runtime/protoimpl is sufficiently up-to-date.
++	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
++)
++
++// Account is the account proto for VLESS.
++type Account struct {
++	state protoimpl.MessageState `protogen:"open.v1"`
++	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
++	Flow string `protobuf:"bytes,2,opt,name=flow,proto3" json:"flow,omitempty"`
++	Encryption string `protobuf:"bytes,3,opt,name=encryption,proto3" json:"encryption,omitempty"`
++	unknownFields protoimpl.UnknownFields
++	sizeCache protoimpl.SizeCache
++}
++
++func (x *Account) Reset() {
++	*x = Account{}
++	mi := &file_proxy_vless_account_proto_msgTypes[0]
++	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++	ms.StoreMessageInfo(mi)
++}
++
++func (x *Account) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*Account) ProtoMessage() {}
++
++func (x *Account) ProtoReflect() protoreflect.Message {
++	mi := &file_proxy_vless_account_proto_msgTypes[0]
++	if x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use Account.ProtoReflect.Descriptor instead.
++func (*Account) Descriptor() ([]byte, []int) {
++	return file_proxy_vless_account_proto_rawDescGZIP(), []int{0}
++}
++
++func (x *Account) GetId() string {
++	if x != nil {
++		return x.Id
++	}
++	return ""
++}
++
++func (x *Account) GetFlow() string {
++	if x != nil {
++		return x.Flow
++	}
++	return ""
++}
++
++func (x *Account) GetEncryption() string {
++	if x != nil {
++		return x.Encryption
++	}
++	return ""
++}
++
++var File_proxy_vless_account_proto protoreflect.FileDescriptor
++
++const file_proxy_vless_account_proto_rawDesc = "" +
++	"\n\x19proxy/vless/" +
++	"account.proto\x12" +
++	"\x10xray.proxy.vl" +
++	"ess\"M\n\x07Account" +
++	"\x12\x0e\n\x02id\x18\x01 \x01(\tR\x02" +
++	"id\x12\x12\n\x04flow\x18\x02 \x01" +
++	"(\tR\x04flow\x12\x1e\n\nen" +
++	"cryption\x18\x03 \x01(\t" +
++	"R\nencryptionB:" +
++	"Z8github.com/c" +
++	"reamcroissant/" +
++	"xboard/pkg/pb/" +
++	"xray/proxy/vle" +
++	"ssb\x06proto3"
++
++var (
++	file_proxy_vless_account_proto_rawDescOnce sync.Once
++	file_proxy_vless_account_proto_rawDescData []byte
++)
++
++func file_proxy_vless_account_proto_rawDescGZIP() []byte {
++	file_proxy_vless_account_proto_rawDescOnce.Do(func() {
++		file_proxy_vless_account_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_proxy_vless_account_proto_rawDesc), len(file_proxy_vless_account_proto_rawDesc)))
++	})
++	return file_proxy_vless_account_proto_rawDescData
++}
++
++
++var file_proxy_vless_account_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
++
++
++var file_proxy_vless_account_proto_goTypes = []any{
++	(*Account)(nil), // 0: xrayvless.Account
++}
++var file_proxy_vless_account_proto_depIdxs = []int32{
++	0, // [0:0] is the sub-list for method output_type
++	0, // [0:0] is the sub-list for method input_type
++	0, // [0:0] is the sub-list for extension type_name
++	0, // [0:0] is the sub-list for extension extendee
++	0, // [0:0] is the sub-list for field type_name
++}
++
++
++func init() { file_proxy_vless_account_proto_init() }
++func file_proxy_vless_account_proto_init() {
++	if File_proxy_vless_account_proto != nil {
++		return
++	}
++	type x struct{}
++	out := protoimpl.TypeBuilder{
++		File: protoimpl.DescBuilder{
++			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
++			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proxy_vless_account_proto_rawDesc), len(file_proxy_vless_account_proto_rawDesc)),
++			NumEnums:      0,
++			NumMessages:   1,
++			NumExtensions: 0,
++			NumServices:   0,
++		},
++		GoTypes:           file_proxy_vless_account_proto_goTypes,
++		DependencyIndexes: file_proxy_vless_account_proto_depIdxs,
++		MessageInfos:      file_proxy_vless_account_proto_msgTypes,
++	}.Build()
++	File_proxy_vless_account_proto = out.File
++	file_proxy_vless_account_proto_goTypes = nil
++	file_proxy_vless_account_proto_depIdxs = nil
++}
++
+diff --git a/experimental/v2rayapi/xraypb/proxy/vmess/account.pb.go b/experimental/v2rayapi/xraypb/proxy/vmess/account.pb.go
+new file mode 100644
+index 0000000..1fe4a05
+--- /dev/null
++++ b/experimental/v2rayapi/xraypb/proxy/vmess/account.pb.go
+@@ -0,0 +1,134 @@
++// Code generated by protoc-gen-go. DO NOT EDIT.
++// versions:
++// 	protoc-gen-go v1.36.11
++// 	protoc        v3.12.4
++// source: proxy/vmess/account.proto
++
++package xrayvmess
++
++import (
++	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
++	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
++	reflect "reflect"
++	sync "sync"
++	unsafe "unsafe"
++)
++
++const (
++	// Verify that this generated code is sufficiently up-to-date.
++	_ = protoimpl.EnforceVersion(20 - protoimpl.MinVersion)
++	// Verify that runtime/protoimpl is sufficiently up-to-date.
++	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
++)
++
++// Account is the account proto for VMess.
++type Account struct {
++	state protoimpl.MessageState `protogen:"open.v1"`
++	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
++	unknownFields protoimpl.UnknownFields
++	sizeCache protoimpl.SizeCache
++}
++
++func (x *Account) Reset() {
++	*x = Account{}
++	mi := &file_proxy_vmess_account_proto_msgTypes[0]
++	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++	ms.StoreMessageInfo(mi)
++}
++
++func (x *Account) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*Account) ProtoMessage() {}
++
++func (x *Account) ProtoReflect() protoreflect.Message {
++	mi := &file_proxy_vmess_account_proto_msgTypes[0]
++	if x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use Account.ProtoReflect.Descriptor instead.
++func (*Account) Descriptor() ([]byte, []int) {
++	return file_proxy_vmess_account_proto_rawDescGZIP(), []int{0}
++}
++
++func (x *Account) GetId() string {
++	if x != nil {
++		return x.Id
++	}
++	return ""
++}
++
++var File_proxy_vmess_account_proto protoreflect.FileDescriptor
++
++const file_proxy_vmess_account_proto_rawDesc = "" +
++	"\n\x19proxy/vmess/" +
++	"account.proto\x12" +
++	"\x10xray.proxy.vm" +
++	"ess\"\x19\n\x07Account" +
++	"\x12\x0e\n\x02id\x18\x01 \x01(\tR\x02" +
++	"idB:Z8github.c" +
++	"om/creamcroiss" +
++	"ant/xboard/pkg" +
++	"/pb/xray/proxy" +
++	"/vmessb\x06proto3"
++
++var (
++	file_proxy_vmess_account_proto_rawDescOnce sync.Once
++	file_proxy_vmess_account_proto_rawDescData []byte
++)
++
++func file_proxy_vmess_account_proto_rawDescGZIP() []byte {
++	file_proxy_vmess_account_proto_rawDescOnce.Do(func() {
++		file_proxy_vmess_account_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_proxy_vmess_account_proto_rawDesc), len(file_proxy_vmess_account_proto_rawDesc)))
++	})
++	return file_proxy_vmess_account_proto_rawDescData
++}
++
++
++var file_proxy_vmess_account_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
++
++
++var file_proxy_vmess_account_proto_goTypes = []any{
++	(*Account)(nil), // 0: xrayvmess.Account
++}
++var file_proxy_vmess_account_proto_depIdxs = []int32{
++	0, // [0:0] is the sub-list for method output_type
++	0, // [0:0] is the sub-list for method input_type
++	0, // [0:0] is the sub-list for extension type_name
++	0, // [0:0] is the sub-list for extension extendee
++	0, // [0:0] is the sub-list for field type_name
++}
++
++
++func init() { file_proxy_vmess_account_proto_init() }
++func file_proxy_vmess_account_proto_init() {
++	if File_proxy_vmess_account_proto != nil {
++		return
++	}
++	type x struct{}
++	out := protoimpl.TypeBuilder{
++		File: protoimpl.DescBuilder{
++			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
++			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proxy_vmess_account_proto_rawDesc), len(file_proxy_vmess_account_proto_rawDesc)),
++			NumEnums:      0,
++			NumMessages:   1,
++			NumExtensions: 0,
++			NumServices:   0,
++		},
++		GoTypes:           file_proxy_vmess_account_proto_goTypes,
++		DependencyIndexes: file_proxy_vmess_account_proto_depIdxs,
++		MessageInfos:      file_proxy_vmess_account_proto_msgTypes,
++	}.Build()
++	File_proxy_vmess_account_proto = out.File
++	file_proxy_vmess_account_proto_goTypes = nil
++	file_proxy_vmess_account_proto_depIdxs = nil
++}
++
+diff --git a/include/v2rayapi_stub.go b/include/v2rayapi_stub.go
+index 7f1f6b9..8a46b6f 100644
+--- a/include/v2rayapi_stub.go
++++ b/include/v2rayapi_stub.go
+@@ -11,7 +11,7 @@ import (
+ )
+ 
+ func init() {
+-	experimental.RegisterV2RayServerConstructor(func(logger log.Logger, options option.V2RayAPIOptions) (adapter.V2RayServer, error) {
++	experimental.RegisterV2RayServerConstructor(func(logger log.Logger, inboundManager adapter.InboundManager, options option.V2RayAPIOptions) (adapter.V2RayServer, error) {
+ 		return nil, E.New(`v2ray api is not included in this build, rebuild with -tags with_v2ray_api`)
+ 	})
+ }
+diff --git a/protocol/trojan/inbound.go b/protocol/trojan/inbound.go
+index 920589b..7c32795 100644
+--- a/protocol/trojan/inbound.go
++++ b/protocol/trojan/inbound.go
+@@ -260,3 +260,31 @@ func (h *inboundTransportHandler) NewConnectionEx(ctx context.Context, conn net.
+ 	h.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
+ 	(*Inbound)(h).NewConnection(ctx, conn, metadata, onClose)
+ }
++
++// UpdateUsers implements adapter.InboundUserManager (runtime user management
++// unified with Xray HandlerService semantics).
++func (h *Inbound) UpdateUsers(users []adapter.ManagedUser) error {
++	indexList := make([]int, 0, len(users))
++	passwordList := make([]string, 0, len(users))
++	for i, u := range users {
++		indexList = append(indexList, i)
++		passwordList = append(passwordList, u.Password)
++	}
++	if err := h.service.UpdateUsers(indexList, passwordList); err != nil {
++		return err
++	}
++	h.users = make([]option.TrojanUser, 0, len(users))
++	for _, u := range users {
++		h.users = append(h.users, option.TrojanUser{Name: u.Name, Password: u.Password})
++	}
++	return nil
++}
++
++// Users implements adapter.InboundUserManager.
++func (h *Inbound) Users() []adapter.ManagedUser {
++	out := make([]adapter.ManagedUser, 0, len(h.users))
++	for _, u := range h.users {
++		out = append(out, adapter.ManagedUser{Name: u.Name, Password: u.Password})
++	}
++	return out
++}
+diff --git a/protocol/vless/inbound.go b/protocol/vless/inbound.go
+index 1589bfb..9086898 100644
+--- a/protocol/vless/inbound.go
++++ b/protocol/vless/inbound.go
+@@ -220,3 +220,32 @@ func (h *inboundTransportHandler) NewConnectionEx(ctx context.Context, conn net.
+ 	h.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
+ 	(*Inbound)(h).NewConnection(ctx, conn, metadata, onClose)
+ }
++
++// UpdateUsers implements adapter.InboundUserManager (runtime user management
++// unified with Xray HandlerService semantics). Replaces the user table at
++// runtime — new connections authenticate immediately, no reload needed.
++func (h *Inbound) UpdateUsers(users []adapter.ManagedUser) error {
++	indexList := make([]int, 0, len(users))
++	uuidList := make([]string, 0, len(users))
++	flowList := make([]string, 0, len(users))
++	for i, u := range users {
++		indexList = append(indexList, i)
++		uuidList = append(uuidList, u.UUID)
++		flowList = append(flowList, u.Flow)
++	}
++	h.service.UpdateUsers(indexList, uuidList, flowList)
++	h.users = make([]option.VLESSUser, 0, len(users))
++	for _, u := range users {
++		h.users = append(h.users, option.VLESSUser{Name: u.Name, UUID: u.UUID, Flow: u.Flow})
++	}
++	return nil
++}
++
++// Users implements adapter.InboundUserManager.
++func (h *Inbound) Users() []adapter.ManagedUser {
++	out := make([]adapter.ManagedUser, 0, len(h.users))
++	for _, u := range h.users {
++		out = append(out, adapter.ManagedUser{Name: u.Name, UUID: u.UUID, Flow: u.Flow})
++	}
++	return out
++}
+diff --git a/protocol/vmess/inbound.go b/protocol/vmess/inbound.go
+index 8783d3e..d10f193 100644
+--- a/protocol/vmess/inbound.go
++++ b/protocol/vmess/inbound.go
+@@ -226,3 +226,33 @@ func (h *inboundTransportHandler) NewConnectionEx(ctx context.Context, conn net.
+ 	h.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
+ 	(*Inbound)(h).NewConnection(ctx, conn, metadata, onClose)
+ }
++
++// UpdateUsers implements adapter.InboundUserManager (runtime user management
++// unified with Xray HandlerService semantics).
++func (h *Inbound) UpdateUsers(users []adapter.ManagedUser) error {
++	indexList := make([]int, 0, len(users))
++	uuidList := make([]string, 0, len(users))
++	alterIDList := make([]int, 0, len(users))
++	for i, u := range users {
++		indexList = append(indexList, i)
++		uuidList = append(uuidList, u.UUID)
++		alterIDList = append(alterIDList, 0)
++	}
++	if err := h.service.UpdateUsers(indexList, uuidList, alterIDList); err != nil {
++		return err
++	}
++	h.users = make([]option.VMessUser, 0, len(users))
++	for _, u := range users {
++		h.users = append(h.users, option.VMessUser{Name: u.Name, UUID: u.UUID})
++	}
++	return nil
++}
++
++// Users implements adapter.InboundUserManager.
++func (h *Inbound) Users() []adapter.ManagedUser {
++	out := make([]adapter.ManagedUser, 0, len(h.users))
++	for _, u := range h.users {
++		out = append(out, adapter.ManagedUser{Name: u.Name, UUID: u.UUID})
++	}
++	return out
++}
