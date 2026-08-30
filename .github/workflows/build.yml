@@ -97,6 +97,12 @@ jobs:
           go mod download
           echo "All modules downloaded OK"
 
+      - name: Patch tailscale for Go 1.24+ compatibility
+        if: steps.check.outputs.build == 'true'
+        run: |
+          cd sing-box-src
+          GOMODCACHE=$(go env GOMODCACHE) python3 ../patches/fix-tailscale-mod.py
+
       - name: Verify build (AMD64)
         if: steps.check.outputs.build == 'true'
         run: |
