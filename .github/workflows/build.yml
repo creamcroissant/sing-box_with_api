@@ -101,7 +101,7 @@ jobs:
         if: steps.check.outputs.build == 'true'
         run: |
           cd sing-box-src
-          GOMODCACHE=$(go env GOMODCACHE) python3 ../patches/fix-tailscale-mod.py
+          python3 ../patches/fix-tailscale-mod.py
 
       - name: Verify build (AMD64)
         if: steps.check.outputs.build == 'true'
