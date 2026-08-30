@@ -107,17 +107,23 @@ jobs:
 
       - name: Verify build (AMD64)
         if: steps.check.outputs.build == 'true'
+        env:
+          VERSION: ${{ steps.check.outputs.target_tag }}
         run: |
           cd sing-box-src
-          GOOS=linux GOARCH=amd64 go build -mod=vendor -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_v2ray_api" -o ../sing-box-linux-amd64 ./cmd/sing-box
+          GOOS=linux GOARCH=amd64 go build -mod=vendor -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION#v}'" -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_v2ray_api" -o ../sing-box-linux-amd64 ./cmd/sing-box
           echo "AMD64 build OK"
+          ../sing-box-linux-amd64 version | head -3
 
       - name: Build ARM64
         if: steps.check.outputs.build == 'true'
+        env:
+          VERSION: ${{ steps.check.outputs.target_tag }}
         run: |
           cd sing-box-src
-          GOOS=linux GOARCH=arm64 go build -mod=vendor -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_v2ray_api" -o ../sing-box-linux-arm64 ./cmd/sing-box
+          GOOS=linux GOARCH=arm64 go build -mod=vendor -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION#v}'" -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_v2ray_api" -o ../sing-box-linux-arm64 ./cmd/sing-box
           echo "ARM64 build OK"
+          ../sing-box-linux-arm64 version | head -3
 
       - name: Create Release
         if: steps.check.outputs.build == 'true'
