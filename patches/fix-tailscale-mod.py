@@ -2,13 +2,17 @@
 """
 Patch tailscale vendored go-json-experiment for Go 1.24+ compatibility.
 
-Replaces reflect.TypeAssert[T](v) with v.Interface().(T) in the
-Go module cache.
+Replaces reflect.TypeAssert[T](v) with v.Interface().(T).
 
-Must be run in the sing-box source dir AFTER 'go mod download'.
+Usage:
+  python3 fix-tailscale-mod.py                    # patch in GOMODCACHE
+  python3 fix-tailscale-mod.py --vendor-dir vendor # patch in vendor dir
+
+Must be run after 'go mod vendor' in the sing-box source dir.
 """
 
 import glob
+import argparse
 import os
 import subprocess
 import sys
@@ -16,44 +20,48 @@ import sys
 TYPEASSERT_LEN = len("reflect.TypeAssert[")
 
 
-def get_gomodcache():
-    """Get GOMODCACHE from go env, with fallback."""
+def find_json_in_vendor(vendor_dir):
+    """Find go-json-experiment inside vendor directory."""
+    # vendor/github.com/sagernet/tailscale/internal/godown/...
+    pattern = os.path.join(vendor_dir,
+        "github.com/sagernet", "tailscale*",
+        "internal", "godown", "github.com", "go-json-experiment", "json")
+    matches = glob.glob(pattern)
+    if matches:
+        return matches[0]
+    return None
+
+
+def find_json_in_gomodcache():
+    """Find go-json-experiment in GOMODCACHE."""
     try:
         result = subprocess.run(
             ["go", "env", "GOMODCACHE"],
             capture_output=True, text=True, timeout=10
         )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except Exception as e:
-        print(f"Warning: go env GOMODCACHE failed ({e})", file=sys.stderr)
+        gomodcache = result.stdout.strip() if result.returncode == 0 else None
+    except Exception:
+        gomodcache = None
 
-    home = os.environ.get("HOME", "/root")
-    fallback = os.path.join(home, "go", "pkg", "mod")
-    print(f"Falling back to {fallback}", file=sys.stderr)
-    return fallback
+    if not gomodcache:
+        gomodcache = os.path.join(os.environ.get("HOME", "/root"), "go", "pkg", "mod")
 
-
-def find_json_dir(gomodcache):
-    """Find the go-json-experiment dir inside tailscale module."""
-    ts_module = "github.com/sagernet/tailscale@v1.92.4-sing-box-1.13-mod.10"
-    candidate = os.path.join(gomodcache, ts_module,
+    # Exact path
+    candidate = os.path.join(gomodcache,
+        "github.com/sagernet/tailscale@v1.92.4-sing-box-1.13-mod.10",
         "internal/godown/github.com/go-json-experiment/json")
     if os.path.isdir(candidate):
         return candidate
 
-    # Search with version suffixes
+    # Wildcard search
     base = os.path.join(gomodcache, "github.com/sagernet")
-    if not os.path.isdir(base):
-        return None
-
-    for entry in os.listdir(base):
-        if entry.startswith("tailscale@") and "mod.10" in entry:
-            candidate = os.path.join(base, entry,
-                "internal/godown/github.com/go-json-experiment/json")
-            if os.path.isdir(candidate):
-                return candidate
-
+    if os.path.isdir(base):
+        for entry in os.listdir(base):
+            if entry.startswith("tailscale@") and "mod.10" in entry:
+                candidate = os.path.join(base, entry,
+                    "internal/godown/github.com/go-json-experiment/json")
+                if os.path.isdir(candidate):
+                    return candidate
     return None
 
 
@@ -74,12 +82,10 @@ def patch_file(fpath):
 
         result.append(content[i:pos])
 
-        # Type name starts after the opening [
         type_start = pos + TYPEASSERT_LEN
         type_end = content.index("]", type_start)
         type_name = content[type_start:type_end]
 
-        # Argument starts at type_end + 1 (the '(' after ']')
         arg_open = type_end + 1
         if arg_open < len(content) and content[arg_open] == '(':
             paren = 1
@@ -108,29 +114,27 @@ def patch_file(fpath):
 
 
 def main():
-    gomodcache = get_gomodcache()
-    print(f"GOMODCACHE: {gomodcache}")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--vendor-dir", help="path to vendor directory")
+    args = parser.parse_args()
 
-    json_dir = find_json_dir(gomodcache)
-    if not json_dir:
-        print("ERROR: go-json-experiment dir not found!", file=sys.stderr)
-        print(f"Looked in: {gomodcache}/github.com/sagernet/", file=sys.stderr)
-        # Debug: list what's available
-        base = os.path.join(gomodcache, "github.com/sagernet")
-        if os.path.isdir(base):
-            print("Available tailscale modules:", file=sys.stderr)
-            for e in os.listdir(base):
-                if "tailscale" in e:
-                    print(f"  {e}", file=sys.stderr)
-        return 1
+    if args.vendor_dir:
+        json_dir = find_json_in_vendor(args.vendor_dir)
+        if not json_dir:
+            print(f"ERROR: go-json-experiment not found under vendor/", file=sys.stderr)
+            return 1
+    else:
+        json_dir = find_json_in_gomodcache()
+        if not json_dir:
+            print("ERROR: go-json-experiment not found in module cache", file=sys.stderr)
+            return 1
 
-    print(f"JSON dir: {json_dir}")
+    print(f"Patching: {json_dir}")
 
     patched = 0
     for fpath in glob.glob(os.path.join(json_dir, "*.go")):
         if patch_file(fpath):
-            name = os.path.basename(fpath)
-            print(f"  Patched: {name}")
+            print(f"  Patched: {os.path.basename(fpath)}")
             patched += 1
 
     remaining = 0
@@ -138,8 +142,7 @@ def main():
         with open(fpath, 'r') as f:
             if "reflect.TypeAssert" in f.read():
                 remaining += 1
-                name = os.path.basename(fpath)
-                print(f"  WARNING: {name} still has reflect.TypeAssert", file=sys.stderr)
+                print(f"  WARNING: {os.path.basename(fpath)} still has TypeAssert", file=sys.stderr)
 
     print(f"Patched {patched} files, {remaining} remaining")
     return 0 if remaining == 0 else 1

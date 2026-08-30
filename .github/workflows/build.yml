@@ -97,24 +97,26 @@ jobs:
           go mod download
           echo "All modules downloaded OK"
 
-      - name: Patch tailscale for Go 1.24+ compatibility
+      - name: Vendor and patch for Go 1.24+ compatibility
         if: steps.check.outputs.build == 'true'
         run: |
           cd sing-box-src
-          python3 ../patches/fix-tailscale-mod.py
+          go mod vendor
+          echo "Vendor done, patching..."
+          python3 ../patches/fix-tailscale-mod.py --vendor-dir vendor
 
       - name: Verify build (AMD64)
         if: steps.check.outputs.build == 'true'
         run: |
           cd sing-box-src
-          GOOS=linux GOARCH=amd64 go build -v -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_v2ray_api" -o ../sing-box-linux-amd64 ./cmd/sing-box
+          GOOS=linux GOARCH=amd64 go build -mod=vendor -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_v2ray_api" -o ../sing-box-linux-amd64 ./cmd/sing-box
           echo "AMD64 build OK"
 
       - name: Build ARM64
         if: steps.check.outputs.build == 'true'
         run: |
           cd sing-box-src
-          GOOS=linux GOARCH=arm64 go build -v -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_v2ray_api" -o ../sing-box-linux-arm64 ./cmd/sing-box
+          GOOS=linux GOARCH=arm64 go build -mod=vendor -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_v2ray_api" -o ../sing-box-linux-arm64 ./cmd/sing-box
           echo "ARM64 build OK"
 
       - name: Create Release
