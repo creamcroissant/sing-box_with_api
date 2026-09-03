@@ -89,6 +89,8 @@ jobs:
           git config user.name "mgpanel CI"
           git apply --verbose "../patches/user-service.patch"
           echo "User Service patch applied OK"
+          git apply --verbose "../patches/loadbalance.patch"
+          echo "Loadbalance patch applied OK"
 
       - name: Pre-download modules
         if: steps.check.outputs.build == 'true'
