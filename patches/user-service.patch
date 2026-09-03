@@ -1907,7 +1907,7 @@ index 6e11c08..2d3da3e 100644
 +++ b/protocol/trojan/inbound.go
 @@ -260,3 +260,30 @@ func (h *inboundTransportHandler) NewConnectionEx(ctx context.Context, conn net.
  	h.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
- 	(*Inbound)(h).NewConnectionEx(ctx, conn, metadata, onClose)
+ 	(*Inbound)(h).NewConnection(ctx, conn, metadata, onClose)
  }
 +// UpdateUsers implements adapter.InboundUserManager (runtime user management
 +// unified with Xray HandlerService semantics).
@@ -1942,7 +1942,7 @@ index 75cd412..c6b1ebb 100644
 +++ b/protocol/vless/inbound.go
 @@ -220,3 +220,31 @@ func (h *inboundTransportHandler) NewConnectionEx(ctx context.Context, conn net.
  	h.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
- 	(*Inbound)(h).NewConnectionEx(ctx, conn, metadata, onClose)
+ 	(*Inbound)(h).NewConnection(ctx, conn, metadata, onClose)
  }
 +// UpdateUsers implements adapter.InboundUserManager (runtime user management
 +// unified with Xray HandlerService semantics). Replaces the user table at
@@ -1978,7 +1978,7 @@ index 4e9c763..f48ea1d 100644
 +++ b/protocol/vmess/inbound.go
 @@ -226,3 +226,32 @@ func (h *inboundTransportHandler) NewConnectionEx(ctx context.Context, conn net.
  	h.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
- 	(*Inbound)(h).NewConnectionEx(ctx, conn, metadata, onClose)
+ 	(*Inbound)(h).NewConnection(ctx, conn, metadata, onClose)
  }
 +// UpdateUsers implements adapter.InboundUserManager (runtime user management
 +// unified with Xray HandlerService semantics).
