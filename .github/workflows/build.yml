@@ -106,6 +106,7 @@ jobs:
           go mod vendor
           echo "Vendor done, patching..."
           python3 ../patches/fix-tailscale-mod.py --vendor-dir vendor
+          python3 ../patches/fix-sing-tun-netlink-spin.py --vendor-dir vendor
 
       - name: Verify build (AMD64)
         if: steps.check.outputs.build == 'true'
